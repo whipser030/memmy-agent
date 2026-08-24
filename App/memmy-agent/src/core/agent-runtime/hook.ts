@@ -139,6 +139,9 @@ export class AgentHook {
   async beforeExecuteTools(ctx: AgentHookContext): Promise<void> {}
   async emitReasoning(reasoningContent?: string | null): Promise<void> {}
   async emitReasoningEnd(): Promise<void> {}
+  async rewrite_llm_content(ctx: AgentHookContext, content: string | null): Promise<string | null> {
+    return content;
+  }
   finalizeContent(ctx: AgentHookContext, content: string | null): string | null {
     return content;
   }
@@ -216,6 +219,18 @@ export class CompositeHook extends AgentHook {
   }
   override async emitReasoningEnd(): Promise<void> {
     await this.forEachHookSafe("emitReasoningEnd");
+  }
+  override async rewrite_llm_content(ctx: AgentHookContext, content: string | null): Promise<string | null> {
+    let next = content;
+    for (const hook of this.hooks) {
+      try {
+        next = await hook.rewrite_llm_content(ctx, next);
+      } catch (error) {
+        if (hook.reraise) throw error;
+        console.error(`AgentHook.rewrite_llm_content error in ${hook.constructor.name}:`, error);
+      }
+    }
+    return next;
   }
   override finalizeContent(ctx: AgentHookContext, content: string | null): string | null {
     let next = content;

@@ -17,6 +17,54 @@ describe("AgentRunner hooks", () => {
     expect(result.finalContent).toBe("done!");
   });
 
+  it("rewrites each model response before tool handling and message append", async () => {
+    let calls = 0;
+    const events: string[] = [];
+    const provider = {
+      chatWithRetry: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return new LLMResponse({
+            content: "planning",
+            toolCalls: [new ToolCallRequest({ id: "call_1", name: "list_dir", arguments: { path: "." } })],
+          });
+        }
+        return new LLMResponse({ content: "done" });
+      },
+    };
+    const tools = {
+      getDefinitions: () => [],
+      get: () => null,
+      execute: async () => "tool result",
+    };
+    class RewriteHook extends AgentHook {
+      override async rewrite_llm_content(context: AgentHookContext, content: string | null): Promise<string | null> {
+        events.push(`rewrite:${context.iteration}:${content}`);
+        return `${content}:rewritten`;
+      }
+      override async beforeExecuteTools(context: AgentHookContext): Promise<void> {
+        events.push(`tools:${context.iteration}:${context.response?.content}`);
+      }
+    }
+
+    const result = await new AgentRunner(provider as any).run(new AgentRunSpec({
+      messages: [],
+      tools,
+      model: "test-model",
+      maxIterations: 3,
+      hook: new RewriteHook(),
+    }));
+
+    expect(events).toEqual([
+      "rewrite:0:planning",
+      "tools:0:planning:rewritten",
+      "rewrite:1:done",
+    ]);
+    expect(result.messages.find((message) => message.tool_calls?.length)?.content).toBe("planning:rewritten");
+    expect(result.finalContent).toBe("done:rewritten");
+    expect(result.messages.at(-1)?.content).toBe("done:rewritten");
+  });
+
   it("calls lifecycle hooks in order with tool context", async () => {
     let calls = 0;
     const events: any[] = [];

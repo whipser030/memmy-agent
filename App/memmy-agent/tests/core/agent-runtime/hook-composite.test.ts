@@ -72,6 +72,39 @@ describe("CompositeHook", () => {
     expect(calls).toEqual(["A:0", "B:0"]);
   });
 
+  it("chains rewritten LLM content in hook order", async () => {
+    class PrefixHook extends AgentHook {
+      override async rewrite_llm_content(_context: AgentHookContext, content: string | null): Promise<string | null> {
+        return `prefix:${content ?? ""}`;
+      }
+    }
+    class SuffixHook extends AgentHook {
+      override async rewrite_llm_content(_context: AgentHookContext, content: string | null): Promise<string | null> {
+        return `${content ?? ""}:suffix`;
+      }
+    }
+
+    await expect(new CompositeHook([new PrefixHook(), new SuffixHook()]).rewrite_llm_content(ctx(), "body"))
+      .resolves.toBe("prefix:body:suffix");
+  });
+
+  it("keeps the last valid LLM content when a rewrite hook fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    class GoodHook extends AgentHook {
+      override async rewrite_llm_content(_context: AgentHookContext, content: string | null): Promise<string | null> {
+        return `${content ?? ""}:good`;
+      }
+    }
+    class BadHook extends AgentHook {
+      override async rewrite_llm_content(): Promise<string | null> {
+        throw new Error("rewrite failed");
+      }
+    }
+
+    await expect(new CompositeHook([new GoodHook(), new BadHook()]).rewrite_llm_content(ctx(), "body"))
+      .resolves.toBe("body:good");
+  });
+
   it("fans out all async methods to every hook", async () => {
     const events: string[] = [];
     class RecordingHook extends AgentHook {

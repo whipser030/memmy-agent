@@ -1567,6 +1567,7 @@ export class AgentRunner {
       (context as any).response = response;
       context.usage = iterationUsage;
       context.toolCalls = [...response.toolCalls];
+      response.content = await hook.rewrite_llm_content(context, response.content);
       if (spec.abortSignal?.aborted || response.errorKind === "aborted") {
         finalContent = "Error: task cancelled";
         stopReason = "cancelled";
@@ -1692,6 +1693,10 @@ export class AgentRunner {
           context,
           imageTextState,
         );
+        (context as any).response = response;
+        if (!spec.abortSignal?.aborted && response.errorKind !== "aborted") {
+          response.content = await hook.rewrite_llm_content(context, response.content);
+        }
         const retryUsage = this.usageDict(response.usage);
         this.accumulateUsage(usage, retryUsage);
         context.usage = this.mergeUsage(iterationUsage, retryUsage);
@@ -1852,6 +1857,10 @@ export class AgentRunner {
                 forceNonStreaming: true,
               },
             );
+            (context as any).response = response;
+            if (!spec.abortSignal?.aborted && response.errorKind !== "aborted") {
+              response.content = await hook.rewrite_llm_content(context, response.content);
+            }
             const finalUsage = this.usageDict(response.usage);
             this.accumulateUsage(usage, finalUsage);
             if (spec.abortSignal?.aborted || response.errorKind === "aborted") {
