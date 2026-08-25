@@ -65,6 +65,97 @@ describe("AgentRunner hooks", () => {
     expect(result.messages.at(-1)?.content).toBe("done:rewritten");
   });
 
+  it("continues after a gated rewrite and discards completion tool calls", async () => {
+    const captured: Array<Array<Record<string, any>>> = [];
+    let calls = 0;
+    let toolExecutions = 0;
+    const provider = {
+      chatWithRetry: async ({ messages }: { messages: Array<Record<string, any>> }) => {
+        captured.push(structuredClone(messages));
+        calls += 1;
+        if (calls === 1) {
+          return new LLMResponse({
+            content: "unverified draft",
+            toolCalls: [new ToolCallRequest({
+              id: "complete_1",
+              name: "update_goal",
+              arguments: { status: "completed" },
+            })],
+          });
+        }
+        return new LLMResponse({ content: "verified answer" });
+      },
+    };
+    const tools = {
+      getDefinitions: () => [],
+      get: () => null,
+      execute: async () => {
+        toolExecutions += 1;
+        return "completed";
+      },
+    };
+    class GateHook extends AgentHook {
+      override requiresBufferedLlmContent(): boolean {
+        return true;
+      }
+      override async rewrite_llm_content(context: AgentHookContext, content: string | null) {
+        if (context.iteration !== 0) return content;
+        return {
+          content: "Before finalizing, I need to verify the page count.",
+          action: "continue" as const,
+          discardToolCalls: true,
+          reason: "INT-07",
+        };
+      }
+    }
+
+    const result = await new AgentRunner(provider as any).run(new AgentRunSpec({
+      messages: [{ role: "user", content: "produce exactly three pages" }],
+      tools,
+      maxIterations: 3,
+      hook: new GateHook(),
+    }));
+
+    expect(toolExecutions).toBe(0);
+    expect(result.finalContent).toBe("verified answer");
+    expect(captured).toHaveLength(2);
+    expect(captured[1]).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "assistant", content: expect.stringContaining("verify the page count") }),
+      expect.objectContaining({ role: "user", content: expect.stringContaining("Resolve the assistant self-review") }),
+    ]));
+  });
+
+  it("buffers provider output when a rewrite hook requires it", async () => {
+    const streamed: string[] = [];
+    const provider = {
+      chatStreamWithRetry: async () => {
+        throw new Error("streaming response must be buffered");
+      },
+      chatWithRetry: async () => new LLMResponse({ content: "safe final" }),
+    };
+    class BufferedHook extends AgentHook {
+      override wantsStreaming(): boolean {
+        return true;
+      }
+      override requiresBufferedLlmContent(): boolean {
+        return true;
+      }
+      override async onStream(_context: AgentHookContext, delta: string): Promise<void> {
+        streamed.push(delta);
+      }
+    }
+
+    const result = await new AgentRunner(provider as any).run(new AgentRunSpec({
+      messages: [],
+      maxIterations: 1,
+      hook: new BufferedHook(),
+    }));
+
+    expect(result.finalContent).toBe("safe final");
+    expect(result.finalContentStreamed).toBe(false);
+    expect(streamed).toEqual([]);
+  });
+
   it("calls lifecycle hooks in order with tool context", async () => {
     let calls = 0;
     const events: any[] = [];

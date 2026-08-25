@@ -72,6 +72,26 @@ describe("CompositeHook", () => {
     expect(calls).toEqual(["A:0", "B:0"]);
   });
 
+  it("collects beforeIteration injections in hook order", async () => {
+    class First extends AgentHook {
+      override async beforeIteration() {
+        return [{ role: "user" as const, content: "first" }];
+      }
+    }
+    class Observer extends AgentHook {}
+    class Last extends AgentHook {
+      override async beforeIteration() {
+        return [{ role: "user" as const, content: "last" }];
+      }
+    }
+
+    await expect(new CompositeHook([new First(), new Observer(), new Last()]).beforeIteration(ctx()))
+      .resolves.toEqual([
+        { role: "user", content: "first" },
+        { role: "user", content: "last" },
+      ]);
+  });
+
   it("chains rewritten LLM content in hook order", async () => {
     class PrefixHook extends AgentHook {
       override async rewrite_llm_content(_context: AgentHookContext, content: string | null): Promise<string | null> {
@@ -86,6 +106,36 @@ describe("CompositeHook", () => {
 
     await expect(new CompositeHook([new PrefixHook(), new SuffixHook()]).rewrite_llm_content(ctx(), "body"))
       .resolves.toBe("prefix:body:suffix");
+  });
+
+  it("preserves continuation controls while later hooks rewrite content", async () => {
+    class GateHook extends AgentHook {
+      override requiresBufferedLlmContent(): boolean {
+        return true;
+      }
+      override async rewrite_llm_content() {
+        return {
+          content: "self-review",
+          action: "continue" as const,
+          discardToolCalls: true,
+          reason: "acceptance gate",
+        };
+      }
+    }
+    class SuffixHook extends AgentHook {
+      override async rewrite_llm_content(_context: AgentHookContext, content: string | null) {
+        return `${content ?? ""}:suffix`;
+      }
+    }
+    const composite = new CompositeHook([new GateHook(), new SuffixHook()]);
+
+    expect(composite.requiresBufferedLlmContent()).toBe(true);
+    await expect(composite.rewrite_llm_content(ctx(), "draft")).resolves.toEqual({
+      content: "self-review:suffix",
+      action: "continue",
+      discardToolCalls: true,
+      reason: "acceptance gate",
+    });
   });
 
   it("keeps the last valid LLM content when a rewrite hook fails", async () => {

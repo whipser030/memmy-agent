@@ -10,7 +10,11 @@ import type { ActualModelContext } from "@memmy/local-api-contracts";
 import { CONTEXT_SAFETY_BUFFER_TOKENS } from "../../token-budget.js";
 import { ToolRegistry } from "./tools/registry.js";
 import type { FileMutationOutcome, ToolExecutionContext } from "./tools/base.js";
-import { AgentHook, AgentHookContext } from "./hook.js";
+import {
+  AgentHook,
+  AgentHookContext,
+  resolveRewriteLlmContentResult,
+} from "./hook.js";
 import {
   buildFinalizationRetryMessage,
   buildLengthRecoveryMessage,
@@ -51,6 +55,8 @@ const PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to m
 export const MAX_EMPTY_RETRIES = 2;
 const MAX_LENGTH_RECOVERIES = 3;
 export const MAX_INJECTIONS_PER_TURN = 3;
+export const MAX_REWRITE_CONTINUATIONS = 2;
+const REWRITE_CONTINUATION_PROMPT = "Continue the task. Resolve the assistant self-review above before presenting or marking the task complete.";
 const MICROCOMPACT_MIN_CHARS = 500;
 const IMAGE_ANALYSIS_MAX_CHARS = 12_000;
 const IMAGE_USER_INTENT_MAX_CHARS = 4_000;
@@ -314,6 +320,33 @@ export class AgentRunner {
       return [{ type: "text", text: String(value) }];
     };
     return [...toBlocks(left), ...toBlocks(right)];
+  }
+
+  /**
+   * Add hook context to a copy used by this model request. The canonical
+   * conversation remains unchanged, matching request-middleware semantics.
+   */
+  static withRequestInjections(
+    messages: Record<string, any>[],
+    injections: void | Array<{ role: "user"; content: string }>,
+  ): Record<string, any>[] {
+    const content = (Array.isArray(injections) ? injections : [])
+      .filter((item) => item?.role === "user" && typeof item.content === "string" && item.content.trim())
+      .map((item) => item.content)
+      .join("\n\n");
+    if (!content) return messages;
+
+    const requestMessages = structuredClone(messages);
+    for (let index = requestMessages.length - 1; index >= 0; index -= 1) {
+      if (requestMessages[index]?.role !== "user") continue;
+      requestMessages[index].content = AgentRunner.mergeMessageContent(
+        requestMessages[index].content,
+        content,
+      );
+      return requestMessages;
+    }
+    requestMessages.push({ role: "user", content });
+    return requestMessages;
   }
 
   static appendInjectedMessages(messages: Record<string, any>[], injections: Record<string, any>[]): void {
@@ -802,10 +835,11 @@ export class AgentRunner {
     const tools = options.toolsOverride === undefined
       ? spec.tools?.getDefinitions?.() ?? []
       : options.toolsOverride;
-    const wantsStreaming = options.forceNonStreaming ? false : hook.wantsStreaming();
+    const forceNonStreaming = options.forceNonStreaming === true || hook.requiresBufferedLlmContent();
+    const wantsStreaming = forceNonStreaming ? false : hook.wantsStreaming();
     const providerRuntime = provider as any;
     const wantsProgressStreaming =
-      !options.forceNonStreaming &&
+      !forceNonStreaming &&
       !wantsStreaming &&
       spec.streamProgressDeltas &&
       spec.progressCallback &&
@@ -814,7 +848,7 @@ export class AgentRunner {
         (provider.constructor as any)?.supportsProgressDeltas === true
       );
     const args = this.buildRequestArgs(spec, messages, tools);
-    const liveFileEdits = !options.forceNonStreaming && spec.progressCallback && onProgressAcceptsFileEditEvents(spec.progressCallback)
+    const liveFileEdits = !forceNonStreaming && spec.progressCallback && onProgressAcceptsFileEditEvents(spec.progressCallback)
       ? new StreamingFileEditTracker({
         workspace: spec.workspace ?? null,
         tools: spec.tools,
@@ -1496,6 +1530,7 @@ export class AgentRunner {
     let emptyContentRetries = 0;
     let lengthRecoveries = 0;
     let injectionCycles = 0;
+    let rewriteContinuations = 0;
     let hadInjections = false;
     const imageTextState: TurnImageTextState = {
       nextImageNumber: 1,
@@ -1536,14 +1571,15 @@ export class AgentRunner {
         }
       }
       let messagesForModel = this.modelContextMessages(messages, modelContextProjection);
+      const context = new AgentHookContext({ spec, messages, iteration, usage });
+      const requestInjections = await hook.beforeIteration(context);
+      messagesForModel = AgentRunner.withRequestInjections(messagesForModel, requestInjections);
       messagesForModel = this.prepareMessagesForModel(spec, messagesForModel, {
         toolsForRequest,
         reservedPromptTokens: 0,
       });
       messagesForModel = this.prepareImageMessages(messagesForModel, imageTextState);
 
-      const context = new AgentHookContext({ spec, messages, iteration, usage });
-      await hook.beforeIteration(context);
       response = await this.requestModelWithImagePolicy(
         spec,
         messagesForModel,
@@ -1567,7 +1603,25 @@ export class AgentRunner {
       (context as any).response = response;
       context.usage = iterationUsage;
       context.toolCalls = [...response.toolCalls];
-      response.content = await hook.rewrite_llm_content(context, response.content);
+      const originalLlmContent = response.content;
+      const rewriteDecision = resolveRewriteLlmContentResult(
+        await hook.rewrite_llm_content(context, response.content),
+      );
+      response.content = rewriteDecision.content;
+      if (rewriteDecision.discardToolCalls) response.toolCalls = [];
+      context.toolCalls = [...response.toolCalls];
+      const rewriteCanContinue = rewriteDecision.action === "continue"
+        && rewriteContinuations < MAX_REWRITE_CONTINUATIONS;
+      if (rewriteDecision.action === "continue" || rewriteDecision.discardToolCalls || rewriteDecision.reason) {
+        context.metadata.rewrite = {
+          action: rewriteCanContinue ? "continue" : "accept",
+          requestedAction: rewriteDecision.action,
+          discardToolCalls: rewriteDecision.discardToolCalls === true,
+          reason: rewriteDecision.reason ?? null,
+          limitReached: rewriteDecision.action === "continue" && !rewriteCanContinue,
+          originalContent: originalLlmContent,
+        };
+      }
       if (spec.abortSignal?.aborted || response.errorKind === "aborted") {
         finalContent = "Error: task cancelled";
         stopReason = "cancelled";
@@ -1581,10 +1635,31 @@ export class AgentRunner {
 
       const [reasoningText, cleanedContent] = extractReasoning(response.reasoningContent, response.thinkingBlocks, response.content);
       response.content = cleanedContent;
-      if (reasoningText && !context.streamedReasoning) {
+      if (reasoningText && !context.streamedReasoning && !rewriteCanContinue) {
         await hook.emitReasoning(reasoningText);
         await hook.emitReasoningEnd();
         context.streamedReasoning = true;
+      }
+
+      if (rewriteCanContinue && !response.shouldExecuteTools) {
+        rewriteContinuations += 1;
+        if (!isBlankText(response.content)) messages.push(buildAssistantMessage(response.content));
+        messages.push({ role: "user", content: REWRITE_CONTINUATION_PROMPT });
+        emptyContentRetries = 0;
+        lengthRecoveries = 0;
+        if (context.streamedContent || context.streamedReasoning) {
+          await hook.onStreamEnd(context, { resuming: true });
+        }
+        await this.emitCheckpoint(spec, {
+          phase: "rewriteContinuation",
+          iteration,
+          model: spec.model,
+          assistantMessage: response.content ? buildAssistantMessage(response.content) : null,
+          completedToolResults: [],
+          pendingToolCalls: [],
+        });
+        await hook.afterIteration(context);
+        continue;
       }
 
       if (response.shouldExecuteTools && spec.tools && response.toolCalls.length) {
@@ -1695,7 +1770,9 @@ export class AgentRunner {
         );
         (context as any).response = response;
         if (!spec.abortSignal?.aborted && response.errorKind !== "aborted") {
-          response.content = await hook.rewrite_llm_content(context, response.content);
+          response.content = resolveRewriteLlmContentResult(
+            await hook.rewrite_llm_content(context, response.content),
+          ).content;
         }
         const retryUsage = this.usageDict(response.usage);
         this.accumulateUsage(usage, retryUsage);
@@ -1859,7 +1936,9 @@ export class AgentRunner {
             );
             (context as any).response = response;
             if (!spec.abortSignal?.aborted && response.errorKind !== "aborted") {
-              response.content = await hook.rewrite_llm_content(context, response.content);
+              response.content = resolveRewriteLlmContentResult(
+                await hook.rewrite_llm_content(context, response.content),
+              ).content;
             }
             const finalUsage = this.usageDict(response.usage);
             this.accumulateUsage(usage, finalUsage);

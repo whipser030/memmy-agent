@@ -79,6 +79,35 @@ export type AgentToolRegistrationContext = {
   metadata: Record<string, any>;
 };
 
+/** Temporary user context for the next model request only. */
+export type HookInjection = {
+  role: "user";
+  content: string;
+};
+
+export type RewriteLlmContentDecision = {
+  content: string | null;
+  action: "accept" | "continue";
+  discardToolCalls?: boolean;
+  reason?: string;
+};
+
+export type RewriteLlmContentResult = string | null | RewriteLlmContentDecision;
+
+export function resolveRewriteLlmContentResult(
+  result: RewriteLlmContentResult,
+): RewriteLlmContentDecision {
+  if (result == null || typeof result === "string") {
+    return { content: result, action: "accept" };
+  }
+  return {
+    content: result.content,
+    action: result.action,
+    discardToolCalls: result.discardToolCalls === true,
+    reason: result.reason,
+  };
+}
+
 export class AgentHookContext {
   spec?: any;
   sessionKey?: string | null;
@@ -133,13 +162,17 @@ export class AgentHook {
     return false;
   }
 
-  async beforeIteration(ctx: AgentHookContext): Promise<void> {}
+  requiresBufferedLlmContent(): boolean {
+    return false;
+  }
+
+  async beforeIteration(ctx: AgentHookContext): Promise<void | HookInjection[]> {}
   async onStream(ctx: AgentHookContext, delta: string): Promise<void> {}
   async onStreamEnd(ctx: AgentHookContext, opts: { resuming?: boolean } = {}): Promise<void> {}
   async beforeExecuteTools(ctx: AgentHookContext): Promise<void> {}
   async emitReasoning(reasoningContent?: string | null): Promise<void> {}
   async emitReasoningEnd(): Promise<void> {}
-  async rewrite_llm_content(ctx: AgentHookContext, content: string | null): Promise<string | null> {
+  async rewrite_llm_content(ctx: AgentHookContext, content: string | null): Promise<RewriteLlmContentResult> {
     return content;
   }
   finalizeContent(ctx: AgentHookContext, content: string | null): string | null {
@@ -173,6 +206,10 @@ export class CompositeHook extends AgentHook {
     return this.hooks.some((hook) => hook.wantsStreaming());
   }
 
+  override requiresBufferedLlmContent(): boolean {
+    return this.hooks.some((hook) => hook.requiresBufferedLlmContent());
+  }
+
   async forEachHookSafe(methodName: string, ...args: any[]): Promise<void> {
     for (const hook of this.hooks) {
       try {
@@ -202,8 +239,23 @@ export class CompositeHook extends AgentHook {
   override async beforeRun(ctx: AgentHookContext): Promise<void> {
     await this.forEachHookSafe("beforeRun", ctx);
   }
-  override async beforeIteration(ctx: AgentHookContext): Promise<void> {
-    await this.forEachHookSafe("beforeIteration", ctx);
+  override async beforeIteration(ctx: AgentHookContext): Promise<HookInjection[]> {
+    const injections: HookInjection[] = [];
+    for (const hook of this.hooks) {
+      try {
+        const items = await hook.beforeIteration(ctx);
+        if (!Array.isArray(items)) continue;
+        for (const item of items) {
+          if (item?.role === "user" && typeof item.content === "string" && item.content.trim()) {
+            injections.push({ role: "user", content: item.content });
+          }
+        }
+      } catch (error) {
+        if (hook.reraise) throw error;
+        console.error(`AgentHook.beforeIteration error in ${hook.constructor.name}:`, error);
+      }
+    }
+    return injections;
   }
   override async onStream(ctx: AgentHookContext, delta: string): Promise<void> {
     await this.forEachHookSafe("onStream", ctx, delta);
@@ -220,17 +272,32 @@ export class CompositeHook extends AgentHook {
   override async emitReasoningEnd(): Promise<void> {
     await this.forEachHookSafe("emitReasoningEnd");
   }
-  override async rewrite_llm_content(ctx: AgentHookContext, content: string | null): Promise<string | null> {
-    let next = content;
+  override async rewrite_llm_content(
+    ctx: AgentHookContext,
+    content: string | null,
+  ): Promise<RewriteLlmContentResult> {
+    let decision: RewriteLlmContentDecision = { content, action: "accept" };
     for (const hook of this.hooks) {
       try {
-        next = await hook.rewrite_llm_content(ctx, next);
+        const current = resolveRewriteLlmContentResult(
+          await hook.rewrite_llm_content(ctx, decision.content),
+        );
+        decision = {
+          content: current.content,
+          action: decision.action === "continue" || current.action === "continue"
+            ? "continue"
+            : "accept",
+          discardToolCalls: decision.discardToolCalls === true || current.discardToolCalls === true,
+          reason: [decision.reason, current.reason].filter(Boolean).join("; ") || undefined,
+        };
       } catch (error) {
         if (hook.reraise) throw error;
         console.error(`AgentHook.rewrite_llm_content error in ${hook.constructor.name}:`, error);
       }
     }
-    return next;
+    return decision.action === "accept" && !decision.discardToolCalls && !decision.reason
+      ? decision.content
+      : decision;
   }
   override finalizeContent(ctx: AgentHookContext, content: string | null): string | null {
     let next = content;

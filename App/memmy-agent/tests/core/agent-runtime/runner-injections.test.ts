@@ -174,6 +174,37 @@ describe("AgentRunner injection drain", () => {
   });
 });
 
+describe("AgentRunner beforeIteration request injections", () => {
+  it("exposes hook text to only the current model request", async () => {
+    const captured: any[][] = [];
+    const provider = makeProvider(async ({ messages }) => {
+      captured.push(structuredClone(messages));
+      return new LLMResponse({ content: "done" });
+    });
+    class RequestInjectionHook extends AgentHook {
+      override async beforeIteration() {
+        return [{ role: "user" as const, content: "memory: verify the result directly" }];
+      }
+    }
+    const initialMessages = [{ role: "user", content: "finish the task" }];
+
+    const result = await new AgentRunner(provider).run(new AgentRunSpec({
+      messages: initialMessages,
+      provider,
+      tools: makeTools(),
+      maxIterations: 1,
+      hook: new RequestInjectionHook(),
+    }));
+
+    expect(captured[0]).toEqual([{
+      role: "user",
+      content: "finish the task\n\nmemory: verify the result directly",
+    }]);
+    expect(initialMessages).toEqual([{ role: "user", content: "finish the task" }]);
+    expect(result.messages[0]).toEqual({ role: "user", content: "finish the task" });
+  });
+});
+
 describe("AgentRunner injection checkpoints", () => {
   it("injects follow-up messages after tool execution", async () => {
     let calls = 0;

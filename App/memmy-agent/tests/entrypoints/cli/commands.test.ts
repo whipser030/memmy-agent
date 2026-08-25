@@ -12,6 +12,7 @@ import { OpenAICompatProvider } from "../../../src/providers/openai-compat-provi
 import { stripModelPrefix as stripCodexModelPrefix } from "../../../src/providers/openai-codex-provider.js";
 import { GitHubCopilotProvider, getStorage } from "../../../src/providers/github-copilot-provider.js";
 import { AgentLoop } from "../../../src/core/agent-runtime/loop.js";
+import { AgentHook } from "../../../src/core/agent-runtime/hook.js";
 import { SessionManager } from "../../../src/core/session/manager.js";
 import { InboundMessage, OutboundMessage } from "../../../src/core/runtime-messages/events.js";
 import { CronJob, CronJobState, CronPayload, CronSchedule } from "../../../src/cron/types.js";
@@ -1962,5 +1963,20 @@ describe("CLI command parity with memmy test_commands", () => {
 
     expect(fs.existsSync(path.join(legacyDir, "jobs.json"))).toBe(true);
     expect(fs.existsSync(path.join(customWorkspace, "cron", "jobs.json"))).toBe(false);
+  });
+
+  it("passes external runtime hooks into direct agent loop construction", async () => {
+    const root = tempRoot();
+    const configPath = writeConfig(root, {});
+    const hook = new AgentHook();
+    const fromConfig = vi.spyOn(AgentLoop, "fromConfig").mockReturnValue(fakeAgentLoop() as any);
+
+    await agent({ message: "hello", config: configPath }, { hooks: [hook] });
+
+    expect(fromConfig).toHaveBeenCalledWith(
+      expect.any(Config),
+      undefined,
+      { hooks: [hook] },
+    );
   });
 });

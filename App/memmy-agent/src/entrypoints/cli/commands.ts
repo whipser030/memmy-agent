@@ -12,6 +12,7 @@ import YAML from "yaml";
 import { MessageBus } from "../../core/runtime-messages/queue.js";
 import { InboundMessage, OutboundMessage } from "../../core/runtime-messages/events.js";
 import { AgentLoop, UNIFIED_SESSION_KEY } from "../../core/agent-runtime/loop.js";
+import type { AgentHook } from "../../core/agent-runtime/hook.js";
 import { CronTool } from "../../core/agent-runtime/tools/cron.js";
 import { MessageTool } from "../../core/agent-runtime/tools/message.js";
 import { prepareManagedChromium } from "../../core/agent-runtime/tools/browser-setup.js";
@@ -91,6 +92,14 @@ export type GatewayRuntime = {
   healthServer: http.Server;
   stop: () => Promise<void>;
 };
+
+export type RuntimeExtensions = {
+  hooks?: AgentHook[] | null;
+};
+
+function runtimeExtensionOptions(extensions: RuntimeExtensions = {}): { hooks?: AgentHook[] } {
+  return extensions.hooks?.length ? { hooks: [...extensions.hooks] } : {};
+}
 
 let cliRuntimeLogs = false;
 
@@ -518,7 +527,7 @@ export async function runInternalCommand(argv: string[]): Promise<boolean> {
   return true;
 }
 
-export async function main(argv: string[] = process.argv): Promise<void> {
+export async function main(argv: string[] = process.argv, extensions: RuntimeExtensions = {}): Promise<void> {
   if (await runInternalCommand(argv)) return;
   if (isRootVersionRequest(argv)) {
     versionCallback(true);
@@ -527,7 +536,14 @@ export async function main(argv: string[] = process.argv): Promise<void> {
   const rootTarget = rootTerminalOptions(argv);
   if (rootTarget) {
     await prepareStartupMigrations();
-    await runRootInteractiveAgent(rootTarget);
+    const ownedGateway = extensions.hooks?.length
+      ? await gateway({}, extensions)
+      : null;
+    try {
+      await runRootInteractiveAgent(rootTarget);
+    } finally {
+      await ownedGateway?.stop();
+    }
     return;
   }
 
@@ -573,7 +589,7 @@ export async function main(argv: string[] = process.argv): Promise<void> {
     .option("-c, --config <path>", "Path to config file")
     .option("-v, --verbose", "Enable verbose runtime logs", false)
     .action(async (opts) => {
-      await serve(opts);
+      await serve(opts, extensions);
     });
 
   app
@@ -585,7 +601,7 @@ export async function main(argv: string[] = process.argv): Promise<void> {
     .option("-c, --config <path>", "Path to config file")
     .option("-v, --verbose", "Enable verbose runtime logs", false)
     .action(async (opts) => {
-      await gateway(opts);
+      await gateway(opts, extensions);
     });
 
   app
@@ -602,7 +618,7 @@ export async function main(argv: string[] = process.argv): Promise<void> {
     .option("--logs", "Enable runtime logs", false)
     .option("--no-logs", "Disable runtime logs")
     .action(async (opts) => {
-      await agent({ ...opts, sessionId: opts.session });
+      await agent({ ...opts, sessionId: opts.session }, extensions);
     });
 
   const sessionsCommand = app.command("sessions").description("Manage terminal sessions.");
@@ -859,11 +875,11 @@ export async function serve({
   workspace?: string | null;
   config?: string | null;
   verbose?: boolean;
-} = {}): Promise<http.Server> {
+} = {}, extensions: RuntimeExtensions = {}): Promise<http.Server> {
   const loaded = loadRuntimeConfig(config, workspace);
   syncRuntimeWorkspaceTemplates(loaded);
   setCliRuntimeLogs(Boolean(verbose));
-  const loop = AgentLoop.fromConfig(loaded);
+  const loop = AgentLoop.fromConfig(loaded, undefined, runtimeExtensionOptions(extensions));
   await initializeLoopRuntimeTools(loop);
   const resolved = loaded.resolvePreset();
   const appServer = createApp(
@@ -1072,7 +1088,7 @@ export async function gateway({
   workspace?: string | null;
   config?: string | null;
   verbose?: boolean;
-} = {}): Promise<GatewayRuntime> {
+} = {}, extensions: RuntimeExtensions = {}): Promise<GatewayRuntime> {
   const loaded = loadRuntimeConfig(config, workspace);
   const workspacePath = syncRuntimeWorkspaceTemplates(loaded);
   setCliRuntimeLogs(Boolean(verbose));
@@ -1083,6 +1099,7 @@ export async function gateway({
   const cron = new CronService(path.join(workspacePath, "cron", "jobs.json"));
   const projectStore = new ProjectStore();
   const loop = AgentLoop.fromConfig(loaded, bus, {
+    ...runtimeExtensionOptions(extensions),
     cronService: cron,
     projectStore,
   });
@@ -1513,12 +1530,12 @@ export async function agent({
   config?: string | null;
   markdown?: boolean;
   logs?: boolean;
-} = {}): Promise<string | null> {
+} = {}, extensions: RuntimeExtensions = {}): Promise<string | null> {
   const invocationCwd = process.cwd();
   const loaded = loadRuntimeConfig(config, workspace);
   syncRuntimeWorkspaceTemplates(loaded);
   setCliRuntimeLogs(Boolean(logs));
-  const loop = AgentLoop.fromConfig(loaded);
+  const loop = AgentLoop.fromConfig(loaded, undefined, runtimeExtensionOptions(extensions));
   const target = resolveTerminalTarget(terminalTargetDependenciesForLoop(loop), {
     sessionId,
     standalone,
@@ -1589,7 +1606,7 @@ export async function agent({
   return runInteractiveAgent(loaded, target.sessionId, {
     renderMarkdown: markdown,
     target,
-  });
+  }, extensions);
 }
 
 export function printCliRestartNoticeIfNeeded(sessionId: string, renderMarkdown = true): boolean {
@@ -1624,9 +1641,10 @@ export async function runInteractiveAgent(
     renderMarkdown?: boolean;
     target?: TerminalTarget | null;
   } = {},
+  extensions: RuntimeExtensions = {},
 ): Promise<null> {
   const bus = new MessageBus();
-  const loop = AgentLoop.fromConfig(config, bus);
+  const loop = AgentLoop.fromConfig(config, bus, runtimeExtensionOptions(extensions));
   if (loop.sessions instanceof SessionManager) {
     loop.guiTranscriptMirror = new GuiTranscriptMirror(
       loop.sessions,
@@ -2129,10 +2147,11 @@ export async function runGateway(
     port = null,
     openBrowserUrl = null,
   }: { port?: number | null; openBrowserUrl?: string | null } = {},
+  extensions: RuntimeExtensions = {},
 ): Promise<{ bus: MessageBus; loop: AgentLoop; manager: ChannelManager }> {
   void port;
   void openBrowserUrl;
-  return gateway({ workspace: config.agents.defaults.workspace });
+  return gateway({ workspace: config.agents.defaults.workspace }, extensions);
 }
 
 export function printCliProgressLine(
