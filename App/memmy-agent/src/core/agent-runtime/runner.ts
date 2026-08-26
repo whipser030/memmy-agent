@@ -1605,20 +1605,23 @@ export class AgentRunner {
       context.toolCalls = [...response.toolCalls];
       const originalLlmContent = response.content;
       const originalToolCalls = [...response.toolCalls];
+      const rewriteBudgetExhausted = rewriteContinuations >= MAX_REWRITE_CONTINUATIONS;
+      // The runner owns continuation accounting. Hooks receive the budget and
+      // decide whether another rewrite is useful within that generic limit.
       context.metadata.rewriteBudget = {
         used: rewriteContinuations,
         max: MAX_REWRITE_CONTINUATIONS,
-        exhausted: rewriteContinuations >= MAX_REWRITE_CONTINUATIONS,
+        exhausted: rewriteBudgetExhausted,
       };
       const rewriteDecision = resolveRewriteLlmContentResult(
         await hook.rewrite_llm_content(context, response.content),
       );
       const rewriteCanContinue = rewriteDecision.action === "continue"
-        && rewriteContinuations < MAX_REWRITE_CONTINUATIONS;
-      const rewriteLimitReached = rewriteDecision.action === "continue" && !rewriteCanContinue;
-      response.content = rewriteLimitReached ? originalLlmContent : rewriteDecision.content;
-      if (rewriteDecision.discardToolCalls && !rewriteLimitReached) response.toolCalls = [];
-      else if (rewriteLimitReached) response.toolCalls = originalToolCalls;
+        && !rewriteBudgetExhausted;
+      const continuationLimitReached = rewriteDecision.action === "continue" && !rewriteCanContinue;
+      response.content = continuationLimitReached ? originalLlmContent : rewriteDecision.content;
+      if (rewriteDecision.discardToolCalls && !continuationLimitReached) response.toolCalls = [];
+      else if (continuationLimitReached) response.toolCalls = originalToolCalls;
       context.toolCalls = [...response.toolCalls];
       if (rewriteDecision.action === "continue" || rewriteDecision.discardToolCalls || rewriteDecision.reason) {
         context.metadata.rewrite = {
@@ -1626,7 +1629,7 @@ export class AgentRunner {
           requestedAction: rewriteDecision.action,
           discardToolCalls: rewriteDecision.discardToolCalls === true,
           reason: rewriteDecision.reason ?? null,
-          limitReached: rewriteLimitReached,
+          limitReached: continuationLimitReached,
           originalContent: originalLlmContent,
         };
       }
