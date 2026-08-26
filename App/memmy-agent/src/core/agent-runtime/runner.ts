@@ -49,7 +49,6 @@ import {
 import { renderTemplate } from "../../utils/prompt-templates.js";
 import type { TurnCancellationBoundary } from "./turn-cancellation-boundary.js";
 import { resolveToolResultMaxChars, type ToolResultMaxCharsByName } from "./tool-result-budget.js";
-import { ACCEPTANCE_BLOCKED_STOP_REASON } from "./stop-reasons.js";
 
 const DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model.";
 const PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]";
@@ -58,7 +57,6 @@ const MAX_LENGTH_RECOVERIES = 3;
 export const MAX_INJECTIONS_PER_TURN = 3;
 export const MAX_REWRITE_CONTINUATIONS = 2;
 const REWRITE_CONTINUATION_PROMPT = "Continue the task. Resolve the assistant self-review above before presenting or marking the task complete.";
-const ACCEPTANCE_BLOCKED_MESSAGE = "Task submission was blocked because acceptance checks remain unresolved after the rewrite continuation limit.";
 const MICROCOMPACT_MIN_CHARS = 500;
 const IMAGE_ANALYSIS_MAX_CHARS = 12_000;
 const IMAGE_USER_INTENT_MAX_CHARS = 4_000;
@@ -1606,21 +1604,29 @@ export class AgentRunner {
       context.usage = iterationUsage;
       context.toolCalls = [...response.toolCalls];
       const originalLlmContent = response.content;
+      const originalToolCalls = [...response.toolCalls];
+      context.metadata.rewriteBudget = {
+        used: rewriteContinuations,
+        max: MAX_REWRITE_CONTINUATIONS,
+        exhausted: rewriteContinuations >= MAX_REWRITE_CONTINUATIONS,
+      };
       const rewriteDecision = resolveRewriteLlmContentResult(
         await hook.rewrite_llm_content(context, response.content),
       );
-      response.content = rewriteDecision.content;
-      if (rewriteDecision.discardToolCalls) response.toolCalls = [];
-      context.toolCalls = [...response.toolCalls];
       const rewriteCanContinue = rewriteDecision.action === "continue"
         && rewriteContinuations < MAX_REWRITE_CONTINUATIONS;
+      const rewriteLimitReached = rewriteDecision.action === "continue" && !rewriteCanContinue;
+      response.content = rewriteLimitReached ? originalLlmContent : rewriteDecision.content;
+      if (rewriteDecision.discardToolCalls && !rewriteLimitReached) response.toolCalls = [];
+      else if (rewriteLimitReached) response.toolCalls = originalToolCalls;
+      context.toolCalls = [...response.toolCalls];
       if (rewriteDecision.action === "continue" || rewriteDecision.discardToolCalls || rewriteDecision.reason) {
         context.metadata.rewrite = {
-          action: rewriteCanContinue ? "continue" : "accept",
+          action: rewriteCanContinue ? "continue" : "accept_original",
           requestedAction: rewriteDecision.action,
           discardToolCalls: rewriteDecision.discardToolCalls === true,
           reason: rewriteDecision.reason ?? null,
-          limitReached: rewriteDecision.action === "continue" && !rewriteCanContinue,
+          limitReached: rewriteLimitReached,
           originalContent: originalLlmContent,
         };
       }
@@ -1662,26 +1668,6 @@ export class AgentRunner {
         });
         await hook.afterIteration(context);
         continue;
-      }
-
-      if (rewriteDecision.action === "continue" && !rewriteCanContinue && !response.shouldExecuteTools) {
-        finalContent = ACCEPTANCE_BLOCKED_MESSAGE;
-        stopReason = ACCEPTANCE_BLOCKED_STOP_REASON;
-        error = "Task acceptance checks remain unresolved after the rewrite continuation limit.";
-        AgentRunner.appendFinalMessage(messages, finalContent);
-        context.finalContent = finalContent;
-        context.error = error;
-        context.stopReason = stopReason;
-        await this.emitCheckpoint(spec, {
-          phase: "acceptanceBlocked",
-          iteration,
-          model: spec.model,
-          assistantMessage: messages.at(-1),
-          completedToolResults: [],
-          pendingToolCalls: [],
-        });
-        await hook.afterIteration(context);
-        break;
       }
 
       if (response.shouldExecuteTools && spec.tools && response.toolCalls.length) {

@@ -4,7 +4,7 @@ import { AgentRunner, AgentRunSpec, MAX_REWRITE_CONTINUATIONS } from "../../../s
 import { LLMResponse, ToolCallRequest } from "../../../src/providers/base.js";
 
 describe("AgentRunner persistent acceptance gate", () => {
-  it("returns acceptance_blocked instead of silently accepting after the continuation limit", async () => {
+  it("accepts the third original model output after two rewrite continuations", async () => {
     let calls = 0;
     const checkpoints: Array<Record<string, unknown>> = [];
     const provider = {
@@ -16,7 +16,7 @@ describe("AgentRunner persistent acceptance gate", () => {
     class PersistentGate extends AgentHook {
       override async rewrite_llm_content(_context: AgentHookContext, content: string | null) {
         return {
-          content,
+          content: `self-review:${content}`,
           action: "continue" as const,
           discardToolCalls: true,
           reason: "INT-07",
@@ -32,11 +32,11 @@ describe("AgentRunner persistent acceptance gate", () => {
     }));
 
     expect(calls).toBe(MAX_REWRITE_CONTINUATIONS + 1);
-    expect(result.stopReason).toBe("acceptance_blocked");
-    expect(result.error).toContain("acceptance checks remain unresolved");
-    expect(result.finalContent).toContain("submission was blocked");
-    expect(result.messages.at(-1)?.content).toContain("submission was blocked");
-    expect(checkpoints.at(-1)).toMatchObject({ phase: "acceptanceBlocked" });
+    expect(result.stopReason).toBe("completed");
+    expect(result.error).toBeNull();
+    expect(result.finalContent).toBe(`unverified draft ${MAX_REWRITE_CONTINUATIONS + 1}`);
+    expect(result.messages.at(-1)?.content).toBe(`unverified draft ${MAX_REWRITE_CONTINUATIONS + 1}`);
+    expect(checkpoints.at(-1)).not.toMatchObject({ phase: "acceptanceBlocked" });
   });
 
   it("still executes corrective tools after the text-only continuation limit", async () => {
