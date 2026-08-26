@@ -228,6 +228,21 @@ describe("SubagentManager run", () => {
     expect((sm.announceResult as any).mock.calls[0][5]).toBe("error");
   });
 
+  it("announces acceptance_blocked runs as error", async () => {
+    const sm = manager();
+    sm.runner.run = vi.fn(async () => runResult({
+      finalContent: "Task submission was blocked.",
+      stopReason: "acceptance_blocked",
+      error: "acceptance checks remain unresolved",
+    }));
+    sm.announceResult = vi.fn(async () => undefined) as any;
+    const status = new SubagentStatus({ taskId: "t1", label: "label", taskDescription: "do task" });
+
+    await sm.runSubagent("t1", "do task", "label", { channel: "cli", chatId: "direct" }, status);
+
+    expect((sm.announceResult as any).mock.calls[0][5]).toBe("error");
+  });
+
   it("records exceptions and announces them as errors", async () => {
     const sm = manager();
     sm.runner.run = vi.fn(async () => {

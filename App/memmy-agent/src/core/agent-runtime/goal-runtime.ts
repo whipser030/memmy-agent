@@ -21,6 +21,7 @@ import {
   type GoalState,
   type GoalStatus,
 } from "../session/goal-state.js";
+import { isFailedStopReason } from "./stop-reasons.js";
 
 export type JsonValue =
   | null
@@ -863,7 +864,7 @@ export class GoalRuntime {
         return { value: { goal: null, publicState: publicGoalState(current), shouldContinue: false } };
       }
       let status = current.status;
-      if (status === "active" && ["error", "toolError"].includes(input.stopReason)) {
+      if (status === "active" && isFailedStopReason(input.stopReason)) {
         status = input.errorCategory === "quota_exhausted" ? "usage_limited" : "blocked";
       }
       const tokensUsed = current.tokensUsed + goalTurnTokens(input.usage);

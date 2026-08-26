@@ -130,6 +130,23 @@ describe("GoalRuntime state transitions", () => {
     expect(ordinary.goal?.status).toBe("blocked");
   });
 
+  it("settles acceptance_blocked as blocked without another continuation", async () => {
+    const { runtime } = createRuntime();
+    const goal = await createGoal(runtime, { turnId: "turn-acceptance-blocked" });
+    const result = await runtime.settleTurn({
+      sessionKey: SESSION_KEY,
+      turnId: "turn-acceptance-blocked",
+      goalId: goal.goalId,
+      usage: {},
+      latencyMs: 0,
+      stopReason: "acceptance_blocked",
+      errorCategory: null,
+    });
+
+    expect(result.goal?.status).toBe("blocked");
+    expect(result.shouldContinue).toBe(false);
+  });
+
   it.each([
     ["rate_limited", null],
     ["network_error", null],

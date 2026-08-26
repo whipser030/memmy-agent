@@ -12,6 +12,7 @@ import { readTemplate } from "../../templates/index.js";
 import { ContextBuilder } from "./context.js";
 import { SkillsLoader } from "./skills.js";
 import type { ActualModelContext } from "../../providers/model-catalog.js";
+import { isFailedStopReason } from "./stop-reasons.js";
 
 export class SubagentStatus {
   static PENDING = "pending";
@@ -403,7 +404,7 @@ export class SubagentManager {
         finalStatus = "error";
         resultText = SubagentManager.formatPartialProgress(result);
         await this.announceResult(taskId, label, task, resultText, origin, "error", originMessageId);
-      } else if (status.stopReason === "error") {
+      } else if (isFailedStopReason(status.stopReason)) {
         finalStatus = "error";
         const errorText = (result as any).error ?? "Error: subagent execution failed.";
         resultText = errorText;
