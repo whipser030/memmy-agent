@@ -13,6 +13,7 @@ import { MessageBus } from "../../core/runtime-messages/queue.js";
 import { InboundMessage, OutboundMessage } from "../../core/runtime-messages/events.js";
 import { AgentLoop, UNIFIED_SESSION_KEY } from "../../core/agent-runtime/loop.js";
 import type { AgentHook } from "../../core/agent-runtime/hook.js";
+import type { GoalState } from "../../core/session/goal-state.js";
 import { CronTool } from "../../core/agent-runtime/tools/cron.js";
 import { MessageTool } from "../../core/agent-runtime/tools/message.js";
 import { prepareManagedChromium } from "../../core/agent-runtime/tools/browser-setup.js";
@@ -617,6 +618,7 @@ export async function main(argv: string[] = process.argv, extensions: RuntimeExt
     .option("--no-markdown", "Render final responses as plain text")
     .option("--logs", "Enable runtime logs", false)
     .option("--no-logs", "Disable runtime logs")
+    .option("--wait-goal", "Wait for a Goal to reach a terminal status", false)
     .action(async (opts) => {
       await agent({ ...opts, sessionId: opts.session }, extensions);
     });
@@ -1521,6 +1523,7 @@ export async function agent({
   config = null,
   markdown = true,
   logs = false,
+  waitGoal = false,
 }: {
   message?: string | null;
   sessionId?: string | null;
@@ -1530,12 +1533,14 @@ export async function agent({
   config?: string | null;
   markdown?: boolean;
   logs?: boolean;
+  waitGoal?: boolean;
 } = {}, extensions: RuntimeExtensions = {}): Promise<string | null> {
   const invocationCwd = process.cwd();
   const loaded = loadRuntimeConfig(config, workspace);
   syncRuntimeWorkspaceTemplates(loaded);
   setCliRuntimeLogs(Boolean(logs));
-  const loop = AgentLoop.fromConfig(loaded, undefined, runtimeExtensionOptions(extensions));
+  const bus = waitGoal ? new MessageBus() : undefined;
+  const loop = AgentLoop.fromConfig(loaded, bus, runtimeExtensionOptions(extensions));
   const target = resolveTerminalTarget(terminalTargetDependenciesForLoop(loop), {
     sessionId,
     standalone,
@@ -1547,6 +1552,19 @@ export async function agent({
     loop.guiTranscriptMirror.sessionUpdated(target.sessionId);
   }
   const input = message ?? (process.stdin.isTTY ? "" : fs.readFileSync(0, "utf8").trim());
+  if (waitGoal) {
+    if (!input) {
+      loop.stop();
+      await Promise.allSettled([
+        closeLoopRuntimeTools(loop),
+        Promise.resolve(loop.sessions.flushAll({
+          exclude: (session) => session.key.startsWith("cli:"),
+        })),
+      ]);
+      throw new Error("--wait-goal requires a Goal command message");
+    }
+    return runHeadlessGoal(loop, bus!, target.sessionId, input);
+  }
   if (input) {
     printCliRestartNoticeIfNeeded(target.sessionId, markdown);
     const renderer = new StreamRenderer({
@@ -1607,6 +1625,137 @@ export async function agent({
     renderMarkdown: markdown,
     target,
   }, extensions);
+}
+
+export type HeadlessGoalResult = {
+  goalId: string;
+  status: GoalState["status"];
+  turns: number;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  tokenBudget: number | null;
+};
+
+export const HEADLESS_GOAL_RESULT_PREFIX = "MEMMY_GOAL_RESULT=";
+
+export function formatHeadlessGoalResult(goal: GoalState, turns: number): string {
+  const result: HeadlessGoalResult = {
+    goalId: goal.goalId,
+    status: goal.status,
+    turns,
+    tokensUsed: goal.tokensUsed,
+    timeUsedSeconds: goal.timeUsedSeconds,
+    tokenBudget: goal.tokenBudget,
+  };
+  return `${HEADLESS_GOAL_RESULT_PREFIX}${JSON.stringify(result)}`;
+}
+
+export async function runHeadlessGoal(
+  loop: AgentLoop,
+  bus: MessageBus,
+  sessionId: string,
+  input: string,
+): Promise<string | null> {
+  const [channel, chatId] = sessionId.includes(":")
+    ? (sessionId.split(/:(.*)/s).filter(Boolean).slice(0, 2) as [string, string])
+    : ["cli", sessionId];
+  const startingGoalId = loop.goalRuntime.get(sessionId)?.goalId ?? null;
+  const goalTurnIds = new Set<string>();
+  let sawAnonymousGoalTurn = false;
+  let sawInitialTurnEnd = false;
+  let waiting = true;
+  let signal: NodeJS.Signals | null = null;
+  let runError: unknown = null;
+  let completedGoal: GoalState | null = null;
+  let endReason = "error";
+  const onSignal = (received: NodeJS.Signals) => {
+    signal = received;
+    waiting = false;
+  };
+  const onSigint = () => onSignal("SIGINT");
+  const onSigterm = () => onSignal("SIGTERM");
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
+
+  const runTask = loop.run();
+  void runTask.catch((error) => {
+    runError = error;
+    waiting = false;
+  });
+
+  try {
+    await bus.publishInbound(new InboundMessage({
+      channel,
+      chatId,
+      senderId: "user",
+      content: input,
+      sessionKeyOverride: sessionId,
+    }));
+
+    while (waiting) {
+      let outbound = bus.outbound.getNowait();
+      while (outbound) {
+        const outboundGoalId = typeof outbound.metadata?.goalId === "string"
+          ? outbound.metadata.goalId
+          : null;
+        if (outboundGoalId) {
+          const turnId = outbound.metadata?.turn_id ?? outbound.metadata?.turnId;
+          if (typeof turnId === "string" && turnId) goalTurnIds.add(turnId);
+          else sawAnonymousGoalTurn = true;
+        }
+        if (
+          outbound.content === ""
+          && typeof (outbound.metadata?.turn_id ?? outbound.metadata?.turnId) === "string"
+        ) {
+          sawInitialTurnEnd = true;
+        }
+        outbound = bus.outbound.getNowait();
+      }
+
+      const goal = loop.goalRuntime.get(sessionId);
+      const isNewGoal = Boolean(goal && goal.goalId !== startingGoalId);
+      if (isNewGoal && goal!.status !== "active" && !loop.isSessionBusy(sessionId)) {
+        completedGoal = goal;
+        endReason = "goal_terminal";
+        break;
+      }
+      if (sawInitialTurnEnd && !isNewGoal && !loop.isSessionBusy(sessionId)) {
+        throw new Error("--wait-goal did not create a Goal");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    if (runError) throw runError;
+    if (signal) {
+      endReason = "interrupt";
+      process.exitCode = signal === "SIGINT" ? 130 : 143;
+      return null;
+    }
+    if (!completedGoal) throw new Error("Goal wait ended before reaching a terminal status");
+  } finally {
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigterm);
+    try {
+      await loop.emitSessionEnd(loop.sessions.get(sessionId) ?? null, sessionId, endReason);
+    } catch {
+      // Best-effort Memory session close on headless Goal exit.
+    }
+    loop.stop();
+    await Promise.allSettled([
+      runTask,
+      closeLoopRuntimeTools(loop),
+      Promise.resolve(loop.sessions.flushAll({
+        exclude: (session) => session.key.startsWith("cli:"),
+      })),
+    ]);
+  }
+
+  const sentinel = formatHeadlessGoalResult(
+    completedGoal,
+    goalTurnIds.size + Number(sawAnonymousGoalTurn),
+  );
+  console.log(sentinel);
+  return sentinel;
 }
 
 export function printCliRestartNoticeIfNeeded(sessionId: string, renderMarkdown = true): boolean {

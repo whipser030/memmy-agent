@@ -1259,6 +1259,111 @@ describe("CLI command helpers", () => {
     expect(loop.sessions.flushAll).toHaveBeenCalledTimes(1);
   });
 
+  it("agent wait-goal runs through MessageBus until the Goal is terminal and idle", async () => {
+    const root = tempRoot("memmy-agent-wait-goal-");
+    const workspace = path.join(root, "workspace");
+    const configPath = writeConfig(root, { agents: { defaults: { workspace } } });
+    const goalId = "00000000-0000-4000-8000-000000000001";
+    const createdAt = "2026-09-03T00:00:00.000Z";
+    let goal: any = null;
+    let busy = false;
+    let running = true;
+    let runtimeBus: any = null;
+    const lifecycle: string[] = [];
+    const processDirect = vi.fn();
+    const loop: any = {
+      workspace,
+      processDirect,
+      goalRuntime: { get: vi.fn(() => goal) },
+      isSessionBusy: vi.fn(() => busy),
+      run: vi.fn(async () => {
+        const inbound = await runtimeBus.nextInbound();
+        expect(inbound.content).toBe("/goal create finish the work");
+        expect(inbound.sessionKey).toBe("cli:direct");
+        busy = true;
+        goal = {
+          goalId,
+          objective: "finish the work",
+          status: "active",
+          tokenBudget: null,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt,
+          updatedAt: createdAt,
+        };
+        await runtimeBus.publishOutbound(new OutboundMessage({
+          channel: "cli",
+          chatId: "direct",
+          content: "Goal created.",
+          metadata: { turn_id: "create-turn" },
+        }));
+        await runtimeBus.publishOutbound(new OutboundMessage({
+          channel: "cli",
+          chatId: "direct",
+          content: "",
+          metadata: { turn_id: "create-turn" },
+        }));
+        await runtimeBus.publishOutbound(new OutboundMessage({
+          channel: "cli",
+          chatId: "direct",
+          content: "stage one",
+          metadata: { turn_id: "goal-turn-1", goalId, goalOutcome: "active" },
+        }));
+        await runtimeBus.publishOutbound(new OutboundMessage({
+          channel: "cli",
+          chatId: "direct",
+          content: "done",
+          metadata: { turn_id: "goal-turn-2", goalId, goalOutcome: "completed" },
+        }));
+        goal = { ...goal, status: "completed", tokensUsed: 17, timeUsedSeconds: 2 };
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        busy = false;
+        while (running) await new Promise((resolve) => setTimeout(resolve, 5));
+      }),
+      stop: vi.fn(() => {
+        lifecycle.push("stop");
+        running = false;
+      }),
+      emitSessionEnd: vi.fn(async () => {
+        lifecycle.push("sessionEnd");
+      }),
+      closeMcp: vi.fn(async () => undefined),
+      sessions: {
+        get: vi.fn(() => ({ key: "cli:direct" })),
+        flushAll: vi.fn(() => 0),
+      },
+    };
+    vi.spyOn(AgentLoop, "fromConfig").mockImplementation((_config, bus) => {
+      runtimeBus = bus;
+      return loop;
+    });
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: any[]) => {
+      logs.push(args.map(String).join(" "));
+    });
+
+    const result = await agent({
+      message: "/goal create finish the work",
+      config: configPath,
+      waitGoal: true,
+      logs: true,
+    });
+
+    expect(processDirect).not.toHaveBeenCalled();
+    expect(loop.run).toHaveBeenCalledOnce();
+    expect(loop.emitSessionEnd).toHaveBeenCalledWith(
+      expect.anything(),
+      "cli:direct",
+      "goal_terminal",
+    );
+    expect(lifecycle).toEqual(["sessionEnd", "stop"]);
+    expect(cliRuntimeLogsEnabled()).toBe(true);
+    expect(logs).toEqual([
+      `MEMMY_GOAL_RESULT={"goalId":"${goalId}","status":"completed","turns":2,"tokensUsed":17,"timeUsedSeconds":2,"tokenBudget":null}`,
+    ]);
+    expect(result).toBe(logs[0]);
+  });
+
   it("agent prints a matching CLI restart notice before a direct turn", async () => {
     const root = tempRoot();
     const configPath = writeConfig(root, { agents: { defaults: { workspace: path.join(root, "workspace"), model: "test-model" } } });
