@@ -83,8 +83,65 @@ export class SkillClusterPipeline {
     }
 
     const at = nowIso();
+    const cluster = await this.assignEpisode(episode, at, job);
+    this.deps.enqueueJob({
+      jobType: "skill_batch_evolve",
+      userId: episode.userId,
+      sessionId: episode.sessionId,
+      episodeId: episode.id,
+      payload: {
+        reason: "skill_cluster_assign",
+        clusterId: cluster.id
+      },
+      createdAt: at
+    });
+  }
+
+  async assignEpisodeForDirectBuild(
+    episodeId: string,
+    at = nowIso(),
+    candidateClusterIds: ReadonlySet<string> = new Set()
+  ): Promise<string> {
+    const episode = this.deps.repos.runtime.getEpisode(episodeId);
+    if (!episode) throw new Error(`direct-skill Episode not found: ${episodeId}`);
+    if (isEvalSplitTest(episode.meta)) throw new Error(`direct-skill refuses test Episode: ${episodeId}`);
+    if (typeof episode.rTask !== "number") throw new Error(`direct-skill Episode is not scored: ${episodeId}`);
+    return (await this.assignEpisode(episode, at, undefined, candidateClusterIds)).id;
+  }
+
+  async buildLegacyClusterForDirectBuild(clusterId: string, at = nowIso()): Promise<string | undefined> {
+    const cluster = this.deps.repos.runtime.getSkillCluster(clusterId);
+    if (!cluster) throw new Error(`direct-skill Cluster not found: ${clusterId}`);
+    const firstMember = this.deps.repos.runtime.listSkillClusterMembers(clusterId)[0];
+    const episode = firstMember ? this.deps.repos.runtime.getEpisode(firstMember.episodeId) : undefined;
+    const job: EvolutionJobRecord = {
+      id: `direct_skill_legacy_${clusterId}`,
+      jobType: "skill_batch_evolve",
+      status: "leased",
+      userId: cluster.userId,
+      sessionId: episode?.sessionId,
+      episodeId: episode?.id,
+      payload: { reason: "direct-skill offline build", clusterId },
+      attempts: 1,
+      maxAttempts: 1,
+      createdAt: at,
+      updatedAt: at
+    };
+    await this.evolveCluster(job);
+    return this.deps.repos.runtime.getSkillCluster(clusterId)?.skillMemoryId;
+  }
+
+  private async assignEpisode(
+    episode: EpisodeRecord,
+    at: string,
+    job?: EvolutionJobRecord,
+    candidateClusterIds?: ReadonlySet<string>
+  ): Promise<SkillClusterRecord> {
     const features = await this.featuresForEpisode(episode);
-    const existing = this.deps.repos.runtime.getSkillClusterForEpisode(episode.id);
+    const previouslyAssigned = this.deps.repos.runtime.getSkillClusterForEpisode(episode.id);
+    const existing = previouslyAssigned && (!candidateClusterIds || candidateClusterIds.has(previouslyAssigned.id))
+      ? previouslyAssigned
+      : undefined;
     let cluster: SkillClusterRecord;
     if (existing) {
       cluster = this.refreshClusterFeatures(existing, features, at);
@@ -99,17 +156,19 @@ export class SkillClusterPipeline {
       const candidates = this.deps.repos.runtime.listSkillClustersByScope({
         userId: episode.userId,
         projectId: episode.projectId
-      });
+      }).filter((candidate) => !candidateClusterIds || candidateClusterIds.has(candidate.id));
       const decision = decideClusterAssignment(features, candidates.map(clusterFeatures), this.clusteringConfig());
-      logEvolutionDecision(job, "skill_cluster_assign", decision.reason, {
-        episodeId: episode.id,
-        clusterId: decision.clusterId,
-        score: decision.score,
-        stage: decision.stage,
-        tools: features.tools,
-        artifacts: features.artifacts,
-        hasQueryVec: Boolean(features.queryVec?.length)
-      });
+      if (job) {
+        logEvolutionDecision(job, "skill_cluster_assign", decision.reason, {
+          episodeId: episode.id,
+          clusterId: decision.clusterId,
+          score: decision.score,
+          stage: decision.stage,
+          tools: features.tools,
+          artifacts: features.artifacts,
+          hasQueryVec: Boolean(features.queryVec?.length)
+        });
+      }
       if (decision.action === "join" && decision.clusterId) {
         const joined = this.deps.repos.runtime.getSkillCluster(decision.clusterId);
         if (!joined) {
@@ -130,17 +189,7 @@ export class SkillClusterPipeline {
     }
 
     this.deps.repos.runtime.updateEpisodeMeta(episode.id, { skill_cluster_id: cluster.id }, at);
-    this.deps.enqueueJob({
-      jobType: "skill_batch_evolve",
-      userId: episode.userId,
-      sessionId: episode.sessionId,
-      episodeId: episode.id,
-      payload: {
-        reason: "skill_cluster_assign",
-        clusterId: cluster.id
-      },
-      createdAt: at
-    });
+    return cluster;
   }
 
   async evolveCluster(job: EvolutionJobRecord): Promise<void> {

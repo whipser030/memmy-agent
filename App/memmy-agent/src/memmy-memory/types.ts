@@ -7,6 +7,7 @@ import type {
   WorkspaceHostId,
   WorkspaceUri
 } from "@memmy/local-api-contracts";
+import type { DirectSkillInterventionMode } from "../direct-skill-runtime/types.js";
 
 export type JsonRecord = Record<string, any>;
 
@@ -53,11 +54,14 @@ export type MemmyMemoryResolvedConfig = {
   enabled: boolean;
   userId?: string;
   retrievalLayers?: MemmyMemoryLayer[];
+  directMode: "off" | "legacy" | "package_v1";
 };
 
 export type MemmyMemoryInstallOptions = {
   workspace?: string | null;
   hooks?: any[];
+  /** Evaluation-only event ablation; deliberately not part of production YAML config. */
+  directSkillInterventionMode?: DirectSkillInterventionMode;
 };
 
 export type MemmyMemorySessionProtocol = "legacy" | "v2";

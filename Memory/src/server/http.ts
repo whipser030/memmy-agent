@@ -19,8 +19,10 @@ import type {
   MemoryReloadConfigRequest,
   MemorySearchRequest,
   RequestEnvelope,
+  RouteDirectSkillPackageRequest,
   RuntimeNamespace,
   SessionOpenRequest,
+  SelectDirectSkillModulesRequest,
   TurnCompleteRequest,
   SourceTurnCompleteRequest,
   TurnStartRequest
@@ -72,6 +74,9 @@ export const API_ROUTES = [
   "POST /api/v1/turns/:turnId/complete",
   "POST /api/v1/source-turns/complete",
   "POST /api/v1/memory/search",
+  "POST /api/v1/direct-skills/build",
+  "POST /api/v1/direct-skills/route-package",
+  "POST /api/v1/direct-skills/select-modules",
   "GET /api/v1/memory/recalls/:queryId",
   "POST /api/v1/memory/add",
   "POST /api/v1/memory/processing/status",
@@ -523,6 +528,21 @@ async function routeRequest(
     autoWorker.schedule();
     return result;
   }
+  if (method === "POST" && path === "/api/v1/direct-skills/build") {
+    requireAdminWrite(principal);
+    const request = asObject(body, "direct-skills.build");
+    const episodeIds = parseRequiredStringArray(
+      request.episodeIds,
+      "direct-skills.build.episodeIds"
+    );
+    if (episodeIds.length !== (request.episodeIds as unknown[]).length) {
+      throw new MemoryServiceError("invalid_argument", "direct-skills.build.episodeIds must not contain duplicates");
+    }
+    if (request.builder !== "legacy" && request.builder !== "package_v1") {
+      throw new MemoryServiceError("invalid_argument", "direct-skills.build.builder must be legacy or package_v1");
+    }
+    return service.buildDirectSkills({ episodeIds, builder: request.builder });
+  }
   if (method === "POST" && path === "/api/v1/admin/shutdown") {
     requireAdminWrite(principal);
     if (!canShutdown) {
@@ -669,7 +689,10 @@ async function routeRequest(
       query: request.query, answer: request.answer, reasoningSummary: request.reasoningSummary,
       toolCalls: request.toolCalls, toolResults: request.toolResults, artifacts: request.artifacts,
       sourceMemoryIds: request.sourceMemoryIds, usage: request.usage, status: request.status,
-      tags: request.tags, userMemoryCorrection: request.userMemoryCorrection
+      tags: request.tags, userMemoryCorrection: request.userMemoryCorrection,
+      directSkillInterventions: Array.isArray(request.directSkillInterventions)
+        ? request.directSkillInterventions
+        : undefined
     });
     if (result.result) scheduleAutoWorkerForEvolution(result.result, autoWorker);
     return result;
@@ -700,6 +723,9 @@ async function routeRequest(
       sourceMemoryIds: request.sourceMemoryIds,
       usage: request.usage,
       status: request.status,
+      directSkillInterventions: Array.isArray(request.directSkillInterventions)
+        ? request.directSkillInterventions
+        : undefined,
       userMemoryCorrection: request.userMemoryCorrection
     };
     const result = await trackExternalHookCapture(
@@ -749,6 +775,89 @@ async function routeRequest(
         ),
       (result) => ({ hit_count: hitCountFromSearchResponse(result) }),
     ));
+  }
+
+  if (method === "POST" && path === "/api/v1/direct-skills/route-package") {
+    requireMemoryRead(principal);
+    const request = requestWithPrincipal<RouteDirectSkillPackageRequest>(
+      body,
+      "direct-skills.route-package",
+      principal
+    );
+    requireStringField(request, "query", "direct-skills.route-package");
+    const publicRequest: RouteDirectSkillPackageRequest = {
+      requestId: request.requestId,
+      adapterId: request.adapterId,
+      namespace: request.namespace,
+      timeZone: request.timeZone,
+      query: request.query,
+      toolNames: parseRequiredStringArray(
+        request.toolNames,
+        "direct-skills.route-package.toolNames",
+        { allowEmpty: true }
+      ),
+      workspace: typeof request.workspace === "string" ? request.workspace : undefined
+    };
+    return service.routeDirectSkillPackage(publicRequest);
+  }
+
+  if (method === "POST" && path === "/api/v1/direct-skills/select-modules") {
+    requireMemoryRead(principal);
+    const request = requestWithPrincipal<SelectDirectSkillModulesRequest>(
+      body,
+      "direct-skills.select-modules",
+      principal
+    );
+    requireStringField(request, "packageId", "direct-skills.select-modules");
+    const event = asObject(request.event, "direct-skills.select-modules.event");
+    const eventTypes = parseRequiredStringArray(
+      event.eventTypes,
+      "direct-skills.select-modules.event.eventTypes"
+    ).filter((value): value is SelectDirectSkillModulesRequest["event"]["eventTypes"][number] =>
+      value === "turn_start" || value === "tool_error" || value === "no_progress" || value === "before_submit"
+    );
+    if (eventTypes.length === 0) {
+      throw new MemoryServiceError("invalid_argument", "direct-skills.select-modules.event.eventTypes is invalid");
+    }
+    if (typeof event.occurredAt !== "string" || !event.occurredAt.trim()) {
+      throw new MemoryServiceError("invalid_argument", "direct-skills.select-modules.event.occurredAt is required");
+    }
+    if (!Array.isArray(request.taskMessages) || !request.taskMessages.every(isRecord)) {
+      throw new MemoryServiceError("invalid_argument", "direct-skills.select-modules.taskMessages must be an array of objects");
+    }
+    const publicRequest: SelectDirectSkillModulesRequest = {
+      requestId: request.requestId,
+      adapterId: request.adapterId,
+      namespace: request.namespace,
+      timeZone: request.timeZone,
+      packageId: request.packageId,
+      candidateModuleIds: parseRequiredStringArray(
+        request.candidateModuleIds,
+        "direct-skills.select-modules.candidateModuleIds",
+        { allowEmpty: true }
+      ),
+      event: {
+        eventTypes,
+        occurredAt: event.occurredAt,
+        toolCalls: parseOptionalObjectArray(
+          event.toolCalls,
+          "direct-skills.select-modules.event.toolCalls"
+        ),
+        toolResults: parseOptionalArray(
+          event.toolResults,
+          "direct-skills.select-modules.event.toolResults"
+        ),
+        toolEvents: parseOptionalObjectArray(
+          event.toolEvents,
+          "direct-skills.select-modules.event.toolEvents"
+        ),
+        draftFinalAnswer: typeof event.draftFinalAnswer === "string" ? event.draftFinalAnswer : undefined,
+        observations: isRecord(event.observations) ? event.observations : undefined
+      },
+      taskMessages: request.taskMessages,
+      draftFinalAnswer: typeof request.draftFinalAnswer === "string" ? request.draftFinalAnswer : undefined
+    };
+    return service.selectDirectSkillModules(publicRequest);
   }
 
   const recallEvidence = match(path, /^\/api\/v1\/memory\/recalls\/([^/]+)$/);
@@ -1570,6 +1679,35 @@ function parseOptionalStringArray(value: unknown, field: string): string[] | und
     throw new MemoryServiceError("invalid_argument", `${field} must be an array of non-empty strings`);
   }
   return [...new Set(value)];
+}
+
+function parseOptionalArray(value: unknown, field: string): unknown[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new MemoryServiceError("invalid_argument", `${field} must be an array`);
+  }
+  return value;
+}
+
+function parseOptionalObjectArray(value: unknown, field: string): Record<string, unknown>[] | undefined {
+  const values = parseOptionalArray(value, field);
+  if (!values) return undefined;
+  if (!values.every(isRecord)) {
+    throw new MemoryServiceError("invalid_argument", `${field} must contain only objects`);
+  }
+  return values;
+}
+
+function parseRequiredStringArray(
+  value: unknown,
+  field: string,
+  options: { allowEmpty?: boolean } = {}
+): string[] {
+  const parsed = parseOptionalStringArray(value, field);
+  if (!parsed || (!options.allowEmpty && parsed.length === 0)) {
+    throw new MemoryServiceError("invalid_argument", `${field} must be a non-empty array of strings`);
+  }
+  return parsed;
 }
 
 function parseApiLogTools(value: string | null): Array<"memory_add" | "memory_search" | "skill_generate" | "skill_evolve"> | undefined {

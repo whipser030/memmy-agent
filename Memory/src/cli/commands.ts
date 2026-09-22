@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import {
   hasOption,
   isRecord,
@@ -91,6 +92,12 @@ export async function runCommand(context: CommandContext): Promise<unknown> {
   const getVerbose = words[0] === "get" && optionBoolean(options, "verbose") === true;
   const request = withSource(await mapTopLevelCommand(words, parsed), parsed);
   const result = await executeRequest(request, requestOptions(parsed, context.fetch));
+  if (words[0] === "direct-skill" && words[1] === "build") {
+    const failures = isRecord(result) && Array.isArray(result.failures) ? result.failures : [];
+    if (failures.length > 0) {
+      throw new Error(`direct-skill build failed for ${failures.length} item(s): ${JSON.stringify(failures)}`);
+    }
+  }
   if (words[0] === "get" && !getVerbose) {
     return compactMemoryGetOutput(result) ?? result;
   }
@@ -127,9 +134,54 @@ async function mapTopLevelCommand(words: string[], parsed: ParsedArgs): Promise<
       return getMemoryRequest(words.slice(1), parsed);
     case "delete":
       return deleteMemoryRequest(words.slice(1), parsed);
+    case "direct-skill":
+      return directSkillRequest(words[1], parsed);
     default:
       throw new Error(`unknown command: ${words.join(" ")}`);
   }
+}
+
+async function directSkillRequest(action: string | undefined, parsed: ParsedArgs): Promise<CliRequest> {
+  if (action !== "build") {
+    throw new Error(`unknown direct-skill command: ${action ?? ""}`.trim());
+  }
+  const manifestPath = requireValue(
+    "episode-manifest",
+    optionString(parsed.options, "episode-manifest")
+  );
+  const builder = optionString(parsed.options, "builder");
+  if (builder !== "legacy" && builder !== "package_v1") {
+    throw new Error("--builder must be legacy or package_v1");
+  }
+  const manifest = parseEpisodeManifest(await readFile(manifestPath, "utf8"));
+  return {
+    method: "POST",
+    path: "/direct-skills/build",
+    body: await requestBody(parsed, {
+      episodeIds: manifest,
+      builder
+    })
+  };
+}
+
+export function parseEpisodeManifest(raw: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("episode manifest must contain valid JSON");
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error("episode manifest must be a non-empty JSON array of Episode IDs");
+  }
+  const episodeIds = parsed.map((value) => typeof value === "string" ? value.trim() : "");
+  if (episodeIds.some((value) => !value)) {
+    throw new Error("episode manifest must contain only non-empty Episode ID strings");
+  }
+  if (new Set(episodeIds).size !== episodeIds.length) {
+    throw new Error("episode manifest contains duplicate Episode IDs");
+  }
+  return episodeIds;
 }
 
 async function reloadConfigRequest(parsed: ParsedArgs): Promise<CliRequest> {
@@ -615,6 +667,7 @@ function helpText(): string {
     "  add <content>                Add a memory manually",
     "  get <id>                     Read one memory by id",
     "  delete <id>                  Delete one memory by id",
+    "  direct-skill build           Build Direct Skills from an Episode manifest",
     "  raw <method> <path>          Call an exposed Memory API route directly",
     "",
     "Setup examples:",
@@ -634,6 +687,7 @@ function helpText(): string {
     `  ${CLI_NAME} add "this project stores memory locally in sqlite" --layer L1`,
     `  ${CLI_NAME} get mem_123`,
     `  ${CLI_NAME} get mem_123 --verbose`,
+    `  ${CLI_NAME} direct-skill build --episode-manifest episode-ids.json --builder package_v1`,
     "",
     "Global options:",
     "  --url <url>                  Memory HTTP service URL",

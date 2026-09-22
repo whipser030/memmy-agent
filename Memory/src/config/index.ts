@@ -58,6 +58,7 @@ export type ReadOnlyInjectionProfile =
 export type CaptureBatchMode = "windowed";
 export type ReflectionContextMode = "none" | "task" | "downstream" | "task_downstream";
 export type LongEpisodeReflectMode = "per_step_parallel" | "per_step_downstream";
+export type DirectSkillMode = "off" | "legacy" | "package_v1";
 
 export interface LlmConfig {
   provider: LlmProviderName;
@@ -225,6 +226,7 @@ export interface AlgorithmConfig {
     outcomeRTaskFailureThreshold: number;
     failureEpisodeScorePenalty: number;
     failureEpisodeMaxRatio: number;
+    directMode: DirectSkillMode;
     directFromTrace: boolean;
     clusterJoinThreshold: number;
     clusterJoinThresholdEmpty: number;
@@ -474,6 +476,7 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
       outcomeRTaskFailureThreshold: -0.15,
       failureEpisodeScorePenalty: 0,
       failureEpisodeMaxRatio: 0.4,
+      directMode: "legacy",
       directFromTrace: true,
       clusterJoinThreshold: 0.5,
       clusterJoinThresholdEmpty: 0.7,
@@ -709,8 +712,21 @@ function resolveRuntimeMemmyMemoryConfig(
   const effectiveRouting = assignmentMode === "account"
     ? { ...routing, summary: "fixed" as const, evolution: "fixed" as const }
     : routing;
+  const algorithm = asRecord(input.algorithm);
+  const skill = asRecord(algorithm.skill);
+  const compatibleAlgorithm = !Object.prototype.hasOwnProperty.call(skill, "directMode") &&
+      Object.prototype.hasOwnProperty.call(skill, "directFromTrace")
+    ? {
+        ...algorithm,
+        skill: {
+          ...skill,
+          directMode: skill.directFromTrace === false ? "off" : "legacy"
+        }
+      }
+    : algorithm;
   return {
     ...input,
+    algorithm: compatibleAlgorithm,
     roleRouting: effectiveRouting,
     summary,
     evolution,
@@ -1230,6 +1246,10 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
       outcomeRTaskFailureThreshold: numberValue(skill.outcomeRTaskFailureThreshold, DEFAULT_MEMMY_CONFIG.algorithm.skill.outcomeRTaskFailureThreshold),
       failureEpisodeScorePenalty: numberValue(skill.failureEpisodeScorePenalty, DEFAULT_MEMMY_CONFIG.algorithm.skill.failureEpisodeScorePenalty),
       failureEpisodeMaxRatio: numberValue(skill.failureEpisodeMaxRatio, DEFAULT_MEMMY_CONFIG.algorithm.skill.failureEpisodeMaxRatio),
+      directMode: directSkillMode(
+        skill.directMode,
+        booleanValue(skill.directFromTrace, DEFAULT_MEMMY_CONFIG.algorithm.skill.directFromTrace) ? "legacy" : "off"
+      ),
       directFromTrace: booleanValue(skill.directFromTrace, DEFAULT_MEMMY_CONFIG.algorithm.skill.directFromTrace),
       clusterJoinThreshold: numberValue(skill.clusterJoinThreshold, DEFAULT_MEMMY_CONFIG.algorithm.skill.clusterJoinThreshold),
       clusterJoinThresholdEmpty: numberValue(skill.clusterJoinThresholdEmpty, DEFAULT_MEMMY_CONFIG.algorithm.skill.clusterJoinThresholdEmpty),
@@ -1305,6 +1325,12 @@ function skillOutputLanguageMode(value: unknown, fallback: "follow_policy" | "zh
   const mode = optionalString(value);
   if (mode === "follow_policy" || mode === "zh" || mode === "en") return mode;
   return fallback;
+}
+
+function directSkillMode(value: unknown, fallback: DirectSkillMode): DirectSkillMode {
+  return value === "off" || value === "legacy" || value === "package_v1"
+    ? value
+    : fallback;
 }
 
 function retrievalTagFilter(value: unknown, fallback: "auto" | "on" | "off"): "auto" | "on" | "off" {

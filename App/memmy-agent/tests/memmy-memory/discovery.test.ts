@@ -94,6 +94,7 @@ describe("memmy memory discovery", () => {
     expect(resolveMemmyMemoryConfig(defaultConfig).enabled).toBe(true);
     expect(resolveMemmyMemoryConfig(enabled).userId).toBe("user_config_1");
     expect(resolveMemmyMemoryConfig(enabled).retrievalLayers).toEqual(["L1", "L3"]);
+    expect(resolveMemmyMemoryConfig(enabled).directMode).toBe("off");
     expect(resolveMemmyMemoryConfig(disabled).enabled).toBe(false);
     expect(resolveMemmyMemoryConfig(disabled).userId).toBe("local-user");
     expect(enabled.toObject().memmyMemory).toEqual({
@@ -137,5 +138,25 @@ describe("memmy memory discovery", () => {
       futureMemorySetting: input.futureMemorySetting,
     });
     expect(resolved).not.toHaveProperty("logging");
+  });
+
+  it("parses Direct Skill runtime mode explicitly", () => {
+    const config = new Config({
+      memmyMemory: { algorithm: { skill: { directMode: "package_v1", directFromTrace: true } } },
+    });
+    expect(resolveMemmyMemoryConfig(config).directMode).toBe("package_v1");
+    expect(config.toObject().memmyMemory.algorithm.skill.directMode).toBe("package_v1");
+    expect(config.toObject().memmyMemory).not.toHaveProperty("directMode");
+  });
+
+  it("maps legacy directFromTrace only when directMode is absent", () => {
+    const legacy = new Config({ memmyMemory: { algorithm: { skill: { directFromTrace: true } } } });
+    const disabled = new Config({ memmyMemory: { algorithm: { skill: { directFromTrace: false } } } });
+    const explicitOff = new Config({
+      memmyMemory: { algorithm: { skill: { directMode: "off", directFromTrace: true } } },
+    });
+    expect(resolveMemmyMemoryConfig(legacy).directMode).toBe("legacy");
+    expect(resolveMemmyMemoryConfig(disabled).directMode).toBe("off");
+    expect(resolveMemmyMemoryConfig(explicitOff).directMode).toBe("off");
   });
 });

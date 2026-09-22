@@ -6386,6 +6386,7 @@ function buildMemoryWhere(filter: MemoryFilter): { where: string; params: SqlVal
   addMemoryKindClause(filter.memoryKind);
   addWorkMemoryScopeClause(filter.workMemoryUserId, filter.workMemoryProjectId);
   addTagClauses(filter.tags);
+  addExcludedTagClauses(filter.excludedTags);
 
   return {
     where: clauses.join(" AND "),
@@ -6482,6 +6483,18 @@ function buildMemoryWhere(filter: MemoryFilter): { where: string; params: SqlVal
         )
       )`);
       params.push(normalized, normalized, normalized);
+    }
+  }
+
+  function addExcludedTagClauses(tags: string[] | undefined): void {
+    for (const tag of tags ?? []) {
+      const normalized = tag.trim().toLowerCase();
+      if (!normalized) continue;
+      clauses.push(`NOT EXISTS (
+        SELECT 1 FROM json_each(memories.tags_json) AS excluded_memory_tag
+        WHERE lower(CAST(excluded_memory_tag.value AS TEXT)) = ?
+      )`);
+      params.push(normalized);
     }
   }
 }

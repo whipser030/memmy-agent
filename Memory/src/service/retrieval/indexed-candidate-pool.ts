@@ -38,11 +38,15 @@ export class IndexedCandidatePool {
     userId: string;
     layers: MemoryLayer[];
     tags?: string[];
+    excludedTags?: string[];
+    scopeUserId?: boolean;
     projectId?: string | null;
   }): number {
     const baseFilter: MemoryFilter = {
       memoryLayer: input.layers,
-      status: ["activated", "resolving"]
+      status: ["activated", "resolving"],
+      excludedTags: input.excludedTags,
+      ...(input.scopeUserId ? { userId: input.userId } : {})
     };
     const scopedFilter = input.layers.includes("L1") && input.projectId !== undefined
       ? { ...baseFilter, workMemoryUserId: input.userId, workMemoryProjectId: input.projectId }
@@ -54,12 +58,16 @@ export class IndexedCandidatePool {
     userId: string;
     layers: MemoryLayer[];
     tags?: string[];
+    excludedTags?: string[];
+    scopeUserId?: boolean;
     projectId?: string | null;
   }): boolean {
     if (input.layers.length === 0) return false;
     const baseFilter: MemoryFilter = {
       memoryLayer: input.layers,
-      status: ["activated", "resolving"]
+      status: ["activated", "resolving"],
+      excludedTags: input.excludedTags,
+      ...(input.scopeUserId ? { userId: input.userId } : {})
     };
     const scopedFilter = input.layers.includes("L1") && input.projectId !== undefined
       ? { ...baseFilter, workMemoryUserId: input.userId, workMemoryProjectId: input.projectId }
@@ -73,6 +81,8 @@ export class IndexedCandidatePool {
     queryVector?: number[];
     layers: MemoryLayer[];
     tags?: string[];
+    excludedTags?: string[];
+    scopeUserId?: boolean;
     projectId?: string | null;
     targetSkillId?: string;
     currentAgentId?: string;
@@ -99,10 +109,12 @@ export class IndexedCandidatePool {
       const filter: MemoryFilter = {
         memoryLayer: layer,
         status: ["activated", "resolving"],
+        ...(input.scopeUserId ? { userId: input.userId } : {}),
         ...(layer === "L1" && input.projectId !== undefined
           ? { workMemoryUserId: input.userId, workMemoryProjectId: input.projectId }
           : {}),
-        ...(input.tags?.length ? { tags: input.tags } : {})
+        ...(input.tags?.length ? { tags: input.tags } : {}),
+        ...(input.excludedTags?.length ? { excludedTags: input.excludedTags } : {})
       };
       const vectorPool = this.retrievalVectorPoolSize(layer, input.config);
       const keywordPool = this.retrievalKeywordPoolSize(layer, input.config);
@@ -150,7 +162,8 @@ export class IndexedCandidatePool {
     return {
       memories: this.deps.repos.memories.getMany(candidateIds).filter((memory) =>
         this.isMemoryReadyForRetrieval(memory) &&
-        this.isSkillVisibleToAgent(memory, input.currentAgentId)
+        this.isSkillVisibleToAgent(memory, input.currentAgentId) &&
+        !hasAnyTag(memory, input.excludedTags)
       ),
       channelScoresByMemory
     };
@@ -244,6 +257,12 @@ export class IndexedCandidatePool {
     const total = this.deps.repos.memories.count(filter);
     return total <= 0 ? [] : this.deps.repos.memories.list(filter, total);
   }
+}
+
+function hasAnyTag(memory: MemoryRow, tags: readonly string[] | undefined): boolean {
+  if (!tags?.length) return false;
+  const excluded = new Set(tags.map((tag) => tag.trim().toLowerCase()).filter(Boolean));
+  return memory.tags.some((tag) => excluded.has(tag.trim().toLowerCase()));
 }
 
 function normalizeAgentId(value: string): string {

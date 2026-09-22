@@ -88,6 +88,7 @@ import {
   buildSearchQuery,
   completeObservedRawTurn,
   normalizeCompleteTurnArtifacts,
+  normalizeDirectSkillInterventions,
   normalizeCompleteTurnSourceMemoryIds,
   normalizeCompleteTurnToolCalls,
   normalizeCompleteTurnToolResults,
@@ -1642,6 +1643,7 @@ export class SessionTurnService {
       const requestToolCalls = normalizeCompleteTurnToolCalls(completionRequest);
       const requestToolResults = normalizeCompleteTurnToolResults(completionRequest);
       const requestArtifacts = normalizeCompleteTurnArtifacts(completionRequest);
+      const directSkillInterventions = normalizeDirectSkillInterventions(completionRequest.directSkillInterventions);
       const turnStartPayload = {
         intent_decision: intentDecision,
         routeProposal: recalledProposal ?? route.proposal,
@@ -1690,7 +1692,10 @@ export class SessionTurnService {
             turn_complete: {
               completed_at: at,
               source_memory_ids: sourceMemoryIds,
-              time_zone: request.timeZone ?? stringFromMaybeRecord(session.meta, "time_zone")
+              time_zone: request.timeZone ?? stringFromMaybeRecord(session.meta, "time_zone"),
+              ...(directSkillInterventions.length
+                ? { direct_skill_interventions: directSkillInterventions }
+                : {})
             }
           },
           status: request.status ?? "succeeded",

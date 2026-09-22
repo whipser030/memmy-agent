@@ -1,4 +1,4 @@
-import type { MemoryAddRequest, RepairSuggestionRequest, ToolCallPayload, TurnCompleteRequest, TurnStartRequest } from "../../types.js";
+import type { DirectSkillInterventionLog, MemoryAddRequest, RepairSuggestionRequest, ToolCallPayload, TurnCompleteRequest, TurnStartRequest } from "../../types.js";
 import type { RawTurnRecord } from "../../storage/repositories.js";
 import { buildPluginRetrievalQuery, isStandaloneMathFinalAnswerTask, STANDALONE_MATH_FINAL_ANSWER_TASK_KIND } from "../../algorithm/plugin-algorithms.js";
 import { stableHash } from "../../utils/id.js";
@@ -23,6 +23,9 @@ export function sanitizeTurnCompleteRequest<T extends TurnCompleteRequest & Reco
     ...request,
     query: sanitizeMemmyProtocolText(String(request.query ?? "")),
     answer: sanitizeMemmyProtocolText(String(request.answer ?? "")),
+    ...(Array.isArray(request.directSkillInterventions)
+      ? { directSkillInterventions: normalizeDirectSkillInterventions(request.directSkillInterventions) }
+      : {}),
     toolCalls: Array.isArray(request.toolCalls) ? toolCalls.map(sanitizeMemmyProtocolValue) : request.toolCalls,
     toolResults: Array.isArray(request.toolResults)
       ? toolResults.map((result, index) => sanitizeCompleteTurnToolResult(result, pairedToolNames.get(index)))
@@ -30,7 +33,7 @@ export function sanitizeTurnCompleteRequest<T extends TurnCompleteRequest & Reco
   };
 }
 export function sanitizeMemoryAddRequest<T extends MemoryAddRequest>(request: T): T { return { ...request, content: sanitizeMemmyProtocolText(request.content ?? ""), title: typeof request.title === "string" ? sanitizeMemmyProtocolText(request.title) : request.title }; }
-export function completeObservedRawTurn(existing: RawTurnRecord, request: TurnCompleteRequest & Record<string, unknown>, completedAt: string): RawTurnRecord { const toolCalls = normalizeCompleteTurnToolCalls(request); const toolResults = normalizeCompleteTurnToolResults(request); const previousComplete = isRecord(existing.messagePayload?.turn_complete) ? existing.messagePayload.turn_complete : {}; return { ...existing, userText: request.query ?? existing.userText, assistantText: request.answer, reasoningSummary: stringFromMaybeRecord(request, "reasoningSummary") ?? existing.reasoningSummary, toolCalls: toolCalls.length ? toolCalls : existing.toolCalls, toolResults: toolResults.length ? toolResults : existing.toolResults, sourceMemoryIds: normalizeCompleteTurnSourceMemoryIds(request, existing.sourceMemoryIds), usage: isRecord(request.usage) ? request.usage : existing.usage, messagePayload: { ...(existing.messagePayload ?? {}), turn_complete: { completed_at: completedAt, source_memory_ids: normalizeCompleteTurnSourceMemoryIds(request, existing.sourceMemoryIds), time_zone: request.timeZone ?? stringFromMaybeRecord(previousComplete, "time_zone") } }, status: request.status ?? "succeeded" }; }
+export function completeObservedRawTurn(existing: RawTurnRecord, request: TurnCompleteRequest & Record<string, unknown>, completedAt: string): RawTurnRecord { const toolCalls = normalizeCompleteTurnToolCalls(request); const toolResults = normalizeCompleteTurnToolResults(request); const previousComplete = isRecord(existing.messagePayload?.turn_complete) ? existing.messagePayload.turn_complete : {}; const directSkillInterventions = normalizeDirectSkillInterventions(request.directSkillInterventions, previousComplete.direct_skill_interventions); return { ...existing, userText: request.query ?? existing.userText, assistantText: request.answer, reasoningSummary: stringFromMaybeRecord(request, "reasoningSummary") ?? existing.reasoningSummary, toolCalls: toolCalls.length ? toolCalls : existing.toolCalls, toolResults: toolResults.length ? toolResults : existing.toolResults, sourceMemoryIds: normalizeCompleteTurnSourceMemoryIds(request, existing.sourceMemoryIds), usage: isRecord(request.usage) ? request.usage : existing.usage, messagePayload: { ...(existing.messagePayload ?? {}), turn_complete: { completed_at: completedAt, source_memory_ids: normalizeCompleteTurnSourceMemoryIds(request, existing.sourceMemoryIds), time_zone: request.timeZone ?? stringFromMaybeRecord(previousComplete, "time_zone"), ...(directSkillInterventions.length ? { direct_skill_interventions: directSkillInterventions } : {}) } }, status: request.status ?? "succeeded" }; }
 export function normalizeCompleteTurnSourceMemoryIds(request: TurnCompleteRequest & Record<string, unknown>, fallback: string[] = []): string[] { return Array.isArray(request.sourceMemoryIds) ? request.sourceMemoryIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0) : fallback; }
 export function normalizeCompleteTurnArtifacts(request: TurnCompleteRequest): NormalizedCompleteTurnArtifact[] { if (!Array.isArray(request.artifacts)) return []; return request.artifacts.map((artifact) => { if (!isRecord(artifact)) return null; const normalized: NormalizedCompleteTurnArtifact = { kind: stringFromRecord(artifact, "kind") ?? "artifact", payload: artifact }; const uri = stringFromRecord(artifact, "uri"); if (uri) normalized.uri = uri; return normalized; }).filter((artifact): artifact is NormalizedCompleteTurnArtifact => Boolean(artifact)); }
 export function normalizeCompleteTurnToolCalls(request: TurnCompleteRequest): ToolCallPayload[] {
@@ -43,6 +46,25 @@ export function normalizeCompleteTurnToolCalls(request: TurnCompleteRequest): To
   }).filter((call): call is ToolCallPayload => Boolean(call));
 }
 export function normalizeCompleteTurnToolResults(request: TurnCompleteRequest): unknown[] { return Array.isArray(request.toolResults) ? request.toolResults : []; }
+export function normalizeDirectSkillInterventions(
+  value: unknown,
+  fallback: unknown = []
+): DirectSkillInterventionLog[] {
+  const primary = Array.isArray(value) ? value : [];
+  const source = primary.length > 0 ? primary : Array.isArray(fallback) ? fallback : [];
+  return source.flatMap((entry) => {
+    if (!isRecord(entry)) return [];
+    const taskKey = stringFromRecord(entry, "taskKey")?.trim();
+    const packageId = stringFromRecord(entry, "packageId")?.trim();
+    const injectedAt = stringFromRecord(entry, "injectedAt")?.trim();
+    const eventTypes = uniqueStrings(entry.eventTypes).filter((event): event is DirectSkillInterventionLog["eventTypes"][number] =>
+      event === "turn_start" || event === "tool_error" || event === "no_progress" || event === "before_submit"
+    );
+    const moduleIds = uniqueStrings(entry.moduleIds);
+    if (!taskKey || !packageId || !injectedAt || eventTypes.length === 0 || moduleIds.length === 0) return [];
+    return [{ taskKey, packageId, eventTypes, moduleIds, injectedAt }];
+  });
+}
 export function rawTurnIdForSessionTurn(sessionId: string, turnId: string): string { return `raw_${stableHash(`${sessionId}:${turnId}`).slice(0, 20)}`; }
 
 function sanitizeCompleteTurnToolResult(value: unknown, pairedToolName: string | undefined): unknown { const toolName = toolNameFromToolResult(value) ?? pairedToolName; if (!isMemmyRecallToolName(toolName)) return sanitizeMemmyProtocolValue(value); const output: Record<string, unknown> = { name: toolName, output: memmyRecallToolPlaceholder(toolName) }; if (isRecord(value)) { const toolCallId = toolInvocationId(value); if (toolCallId) output.toolCallId = toolCallId; } return output; }
@@ -87,4 +109,5 @@ function timeFromRecord(record: Record<string, unknown>, key: string): string | 
 function stringFromRecord(record: Record<string, unknown>, key: string): string | undefined { const value = record[key]; return typeof value === "string" ? value : undefined; }
 function stringFromMaybeRecord(value: unknown, key: string): string | undefined { return isRecord(value) ? stringFromRecord(value, key) : undefined; }
 function errorMessageFromUnknown(value: unknown): string | undefined { if (typeof value === "string" && value.trim()) return value.trim(); if (value instanceof Error) return value.message; return isRecord(value) ? stringFromRecord(value, "message") : undefined; }
+function uniqueStrings(value: unknown): string[] { return Array.isArray(value) ? [...new Set(value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean))] : []; }
 function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }

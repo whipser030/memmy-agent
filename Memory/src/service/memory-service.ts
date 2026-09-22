@@ -75,11 +75,15 @@ import type {
   RecallMemoryLayer,
   RepairSuggestionRequest,
   RequestEnvelope,
+  RouteDirectSkillPackageRequest,
+  RouteDirectSkillPackageResponse,
   RetrievalMode,
   RuntimeNamespace,
   SessionCompactRequest,
   SessionL3WorldModelContextResponse,
   SessionOpenRequest,
+  SelectDirectSkillModulesRequest,
+  SelectDirectSkillModulesResponse,
   SkillUseRequest,
   SubagentCompleteRequest,
   SubagentStartRequest,
@@ -123,6 +127,12 @@ import {
   toolCallsFromUnknown
 } from "./import/memory-import-pipeline.js";
 import { EpisodeTitleService } from "./episode-title/episode-title-service.js";
+import {
+  DirectSkillBuildService,
+  type DirectSkillBuildRequest,
+  type DirectSkillBuildResult
+} from "./direct-skill/direct-skill-build-service.js";
+import { DirectSkillRetrievalService } from "./direct-skill/direct-skill-retrieval-service.js";
 import { recordApiLog } from "./model-audit/model-call-audit.js";
 import { ProjectEnvironmentService } from "./project-environment/project-environment-service.js";
 import {
@@ -249,6 +259,8 @@ export class MemoryService {
   private readonly projectEnvironment: ProjectEnvironmentService;
   private readonly panelReadModel: PanelReadModel;
   private readonly retrieval: RetrievalService;
+  private readonly directSkillRetrieval: DirectSkillRetrievalService;
+  private readonly directSkillBuild: DirectSkillBuildService;
   private readonly sessionTurns: SessionTurnService;
   private readonly skillReadModel: SkillReadModel;
   private readonly workerHandlers: ReturnType<typeof createWorkerJobHandlers>;
@@ -362,6 +374,19 @@ export class MemoryService {
       scheduleEmbeddingAfterTextUpdate: (input) => this.embeddingJobs.scheduleEmbeddingAfterTextUpdate(input),
       repairEvidenceValueDiff: sessionRepairEvidenceValueDiff,
       queryVector: this.queryVector.bind(this)
+    });
+    const directSkillBuildOwner = this;
+    this.directSkillBuild = new DirectSkillBuildService({
+      repos: this.repos,
+      get config() { return directSkillBuildOwner.config; },
+      get skillLlm() { return directSkillBuildOwner.skillLlm; },
+      buildMemory: (input) => this.buildMemory(input as Parameters<MemoryService["buildMemory"]>[0]),
+      upsertEvolutionMemory: this.evolutionJobs.upsertEvolutionMemory.bind(this.evolutionJobs),
+      enqueueJob: this.workerHandlers.enqueueJob,
+      namespaceIdFromMemory,
+      queryVector: this.queryVector.bind(this),
+      embedAfterCapture: () => this.config.algorithm.capture.embedAfterCapture,
+      nowIso
     });
     const trialOwner = this;
     this.skillTrials = new SkillTrialResolver({
@@ -563,6 +588,15 @@ export class MemoryService {
       memoryHasImportPipeline,
       namespaceIdFromContext,
       withTimeout
+    });
+    const directSkillRetrievalOwner = this;
+    this.directSkillRetrieval = new DirectSkillRetrievalService({
+      repos: this.repos,
+      get config() { return directSkillRetrievalOwner.config; },
+      get skillLlm() { return directSkillRetrievalOwner.skillLlm; },
+      get embedder() { return directSkillRetrievalOwner.embedder; },
+      resolveContext: this.resolveContext.bind(this),
+      memoryHasImportPipeline
     });
     const sessionTurnOwner = this;
     this.sessionTurns = new SessionTurnService({
@@ -1171,6 +1205,26 @@ export class MemoryService {
     serverTime: string;
   }> {
     return this.withModelTaskContext(() => this.retrieval.search(this.withTimeZone(request)));
+  }
+
+  async routeDirectSkillPackage(
+    request: RouteDirectSkillPackageRequest
+  ): Promise<RouteDirectSkillPackageResponse> {
+    return this.withModelTaskContext(() =>
+      this.directSkillRetrieval.routePackage(this.withTimeZone(request))
+    );
+  }
+
+  async buildDirectSkills(request: DirectSkillBuildRequest): Promise<DirectSkillBuildResult> {
+    return this.withModelTaskContext(() => this.directSkillBuild.build(request));
+  }
+
+  async selectDirectSkillModules(
+    request: SelectDirectSkillModulesRequest
+  ): Promise<SelectDirectSkillModulesResponse> {
+    return this.withModelTaskContext(() =>
+      this.directSkillRetrieval.selectModules(this.withTimeZone(request))
+    );
   }
 
 

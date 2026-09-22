@@ -10,12 +10,14 @@ import { MemmyMemoryClient } from "./client.js";
 import { resolveMemmyMemoryConfig } from "./config.js";
 import { discoverMemmyMemoryConnection } from "./discovery.js";
 import { MemmyMemoryHook } from "./hook.js";
+import { DirectSkillRuntimeHook } from "../direct-skill-runtime/hook.js";
 import type { MemmyMemoryInstallOptions } from "./types.js";
 
 export type MemmyMemoryIntegration = {
   enabled: boolean;
   client?: MemmyMemoryClient;
   hook?: MemmyMemoryHook;
+  directSkillHook?: DirectSkillRuntimeHook;
   dispose?: () => Promise<void>;
   closeSession?: (sessionKey: string, reason?: string) => Promise<void>;
 };
@@ -50,6 +52,9 @@ export function createMemmyMemoryIntegration(
     getAnalyticsUserId: () => resolveLiveLoggedInAnalyticsUserId(),
     getAnalyticsUserMode: () => resolveLiveAnalyticsUserMode(),
   });
+  const directSkillHook = resolved.directMode === "package_v1"
+    ? new DirectSkillRuntimeHook(client, hook, options.directSkillInterventionMode ?? "full")
+    : undefined;
   void hook.initialize().catch((error) => {
     hook.lastError = error instanceof Error ? error.message : String(error);
   });
@@ -57,6 +62,7 @@ export function createMemmyMemoryIntegration(
     enabled: true,
     client,
     hook,
+    directSkillHook,
     dispose: () => hook.dispose(),
     closeSession: (sessionKey, reason = "deleted") => hook.sessionEnd(new AgentHookContext({
       sessionKey,
@@ -72,5 +78,6 @@ export function installMemmyMemory(
 ): MemmyMemoryIntegration {
   const integration = createMemmyMemoryIntegration(config, options);
   if (integration.hook && Array.isArray(options.hooks)) options.hooks.push(integration.hook);
+  if (integration.directSkillHook && Array.isArray(options.hooks)) options.hooks.push(integration.directSkillHook);
   return integration;
 }

@@ -130,6 +130,20 @@ export class MemmyMemoryClient {
     return this.post("/api/v1/memory/search", body);
   }
 
+  routeDirectSkillPackage(body: JsonRecord & MemmyMemoryRequestEnvelope): Promise<JsonRecord> {
+    return this.request("POST", "/api/v1/direct-skills/route-package", {
+      body,
+      timeoutMs: INTERACTIVE_MEMORY_TIMEOUT_MS,
+    });
+  }
+
+  selectDirectSkillModules(body: JsonRecord & MemmyMemoryRequestEnvelope): Promise<JsonRecord> {
+    return this.request("POST", "/api/v1/direct-skills/select-modules", {
+      body,
+      timeoutMs: INTERACTIVE_MEMORY_TIMEOUT_MS,
+    });
+  }
+
   getMemory(id: string): Promise<JsonRecord> {
     return this.get(`/api/v1/memory/${encodeURIComponent(id)}`);
   }

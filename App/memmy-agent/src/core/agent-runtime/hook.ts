@@ -149,6 +149,8 @@ export class AgentHook {
   async afterRun(ctx: AgentHookContext, result: any): Promise<void> { void ctx; void result; }
   async beforeToolCall(ctx: AgentHookContext, toolCall: any): Promise<void> { void ctx; void toolCall; }
   async afterToolCall(ctx: AgentHookContext, toolCall: any, result: any): Promise<void> { void ctx; void toolCall; void result; }
+  async afterToolBatch(ctx: AgentHookContext): Promise<void> { void ctx; }
+  async beforeFinalResponse(ctx: AgentHookContext): Promise<void> { void ctx; }
   async afterIteration(ctx: AgentHookContext): Promise<void> { void ctx; }
   async sessionStart(ctx: AgentHookContext): Promise<void> { void ctx; }
   async sessionEnd(ctx: AgentHookContext): Promise<void> { void ctx; }
@@ -239,6 +241,12 @@ export class CompositeHook extends AgentHook {
   }
   override async afterToolCall(ctx: AgentHookContext, toolCall: any, result: any): Promise<void> {
     await this.forEachHookSafe("afterToolCall", ctx, toolCall, result);
+  }
+  override async afterToolBatch(ctx: AgentHookContext): Promise<void> {
+    await this.forEachHookSafe("afterToolBatch", ctx);
+  }
+  override async beforeFinalResponse(ctx: AgentHookContext): Promise<void> {
+    await this.forEachHookSafe("beforeFinalResponse", ctx);
   }
   override async afterIteration(ctx: AgentHookContext): Promise<void> {
     await this.forEachHookSafe("afterIteration", ctx);

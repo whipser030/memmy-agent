@@ -123,6 +123,9 @@ import { SubagentManager } from "./subagent.js";
 import { AutoCompact } from "./autocompact.js";
 import { configuredModelPresets, defaultSelectionSignature, makePresetSnapshotLoader, normalizePresetName } from "./model-presets.js";
 import { installMemmyMemory, type MemmyMemoryIntegration } from "../../memmy-memory/index.js";
+import type { DirectSkillInjection } from "../../direct-skill-runtime/types.js";
+import type { DirectSkillInterventionMode } from "../../direct-skill-runtime/types.js";
+import { discardDirectSkillInjectionsForTask } from "../../direct-skill-runtime/queue.js";
 import { createKnowledgeHook } from "../../knowledge/register.js";
 import { createByokTokenUsageRecorder, installByokTokenUsage } from "../../integrations/byok-token-usage/index.js";
 import {
@@ -371,6 +374,8 @@ type AgentLoopInit = {
   mcpServers?: Record<string, any>;
   cronService?: CronService;
   hooks?: AgentHook[];
+  /** Evaluation/test injection point; not loaded from production YAML. */
+  directSkillInterventionMode?: DirectSkillInterventionMode;
   sessionDagQueue?: SessionDagQueueManager | null;
   projectStore?: ProjectStore | null;
   guiTranscriptMirror?: GuiTranscriptMirrorLike | null;
@@ -809,6 +814,7 @@ export class AgentLoop {
     this.memmyMemoryIntegration = installMemmyMemory(this.config, {
       workspace: this.workspace,
       hooks: this.extraHooks,
+      directSkillInterventionMode: init.directSkillInterventionMode ?? "full",
     });
     installByokTokenUsage(this.config, { hooks: this.extraHooks });
     this.provider = init.provider ?? makeProvider(this.config);
@@ -2575,6 +2581,9 @@ export class AgentLoop {
       ...(queueSteerOrigin && msg.metadata?.webui_queue_steer_recovery
         ? { webui_queue_steer_recovery: structuredClone(msg.metadata.webui_queue_steer_recovery) }
         : {}),
+      ...(msg.metadata?.direct_skill_intervention
+        ? { direct_skill_intervention: structuredClone(msg.metadata.direct_skill_intervention) }
+        : {}),
     };
   }
 
@@ -3544,8 +3553,10 @@ export class AgentLoop {
       },
     });
     const hook = this.extraHooks.length ? new CompositeAgentHook([loopHook, ...this.extraHooks]) : loopHook;
-    const result = await this.runner.run(
-      new AgentRunSpec({
+    let result;
+    try {
+      result = await this.runner.run(
+        new AgentRunSpec({
         messages: initialMessages,
         provider: activeProvider,
         tools: activeTools,
@@ -3576,6 +3587,22 @@ export class AgentLoop {
         hook,
         concurrentTools: true,
         injectionCallback: ({ limit = 3 } = {}) => this.drainPendingQueue(pendingQueue, limit, session?.key ?? sessionKey),
+        injectionEnqueueCallback: (payload: DirectSkillInjection) => {
+          if (!pendingQueue || !payload.content.trim()) return false;
+          pendingQueue.put(new InboundMessage({
+            channel: channel ?? "direct",
+            chatId: chatId ?? "direct-skill-runtime",
+            senderId: "direct-skill-runtime",
+            text: payload.content,
+            role: "user",
+            sessionKey: activeSessionKey ?? undefined,
+            metadata: {
+              ...(turnId ? turnMetadata(turnId) : {}),
+              direct_skill_intervention: payload.directSkillIntervention,
+            },
+          }));
+          return true;
+        },
         internalTurnContext,
         actualModelContext: modelSelection ? persistedModelSelection(modelSelection) : null,
         onMaxFinalizationStarting,
@@ -3589,8 +3616,11 @@ export class AgentLoop {
               onTokenCompactionEvent,
             )
           : null,
-      }),
-    );
+        }),
+      );
+    } finally {
+      discardDirectSkillInjectionsForTask(pendingQueue, turnId);
+    }
     const rawUsage = result.usage ?? result.response?.usage;
     const usage = normalizeUsageRecord(rawUsage);
     if (activeSessionKey) {

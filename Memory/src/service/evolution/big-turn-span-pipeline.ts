@@ -78,6 +78,10 @@ interface BigTurnSpanDeps {
   embedAfterCapture(): boolean;
 }
 
+export type DirectSkillSegmentationResult =
+  | { mode: "single_goal"; rawTurnId: string }
+  | { mode: "multi_goal"; rawTurnId: string; spanIds: string[] };
+
 export class BigTurnSpanPipeline {
   constructor(private readonly deps: BigTurnSpanDeps) {}
 
@@ -92,6 +96,60 @@ export class BigTurnSpanPipeline {
       : undefined;
     if (!source || !rawTurn || rawTurn.toolCalls.length < SPAN_BIG_TURN_MIN_TOOL_CALLS) return;
 
+    await this.analyzeAndStore(source, rawTurn, job);
+  }
+
+  async segmentForDirectSkill(input: {
+    sourceTraceId: string;
+    rawTurnId: string;
+    episodeId: string;
+    rTask?: number;
+    rewardReason?: string;
+    at?: string;
+  }): Promise<DirectSkillSegmentationResult> {
+    const source = this.deps.repos.memories.get(input.sourceTraceId);
+    if (!source) throw new Error(`direct-skill source Trace not found: ${input.sourceTraceId}`);
+    const rawTurn = this.deps.repos.runtime.getRawTurn(input.rawTurnId);
+    if (!rawTurn) throw new Error(`direct-skill Raw Turn not found: ${input.rawTurnId}`);
+    if (rawTurn.episodeId !== input.episodeId) {
+      throw new Error(`direct-skill Raw Turn ${rawTurn.id} does not belong to Episode ${input.episodeId}`);
+    }
+    if (rawTurn.toolCalls.length < SPAN_BIG_TURN_MIN_TOOL_CALLS) {
+      return { mode: "single_goal", rawTurnId: rawTurn.id };
+    }
+    if (!SPAN_BIG_TURN_ENABLED || !this.deps.llm.isConfigured()) {
+      throw new Error("direct-skill long-turn segmentation requires a configured LLM");
+    }
+    const at = input.at ?? new Date().toISOString();
+    const job: EvolutionJobRecord = {
+      id: `direct_skill_span_${stableHash(`${input.episodeId}:${input.rawTurnId}`).slice(0, 20)}`,
+      jobType: "span_big_turn",
+      status: "leased",
+      userId: source.userId,
+      sessionId: source.sessionId,
+      episodeId: input.episodeId,
+      targetMemoryId: source.id,
+      payload: {
+        rawTurnId: rawTurn.id,
+        rTask: input.rTask,
+        rewardReason: input.rewardReason ?? "direct-skill offline build"
+      },
+      attempts: 1,
+      maxAttempts: 1,
+      createdAt: at,
+      updatedAt: at
+    };
+    const spanIds = await this.analyzeAndStore(source, rawTurn, job);
+    return spanIds.length === 0
+      ? { mode: "single_goal", rawTurnId: rawTurn.id }
+      : { mode: "multi_goal", rawTurnId: rawTurn.id, spanIds };
+  }
+
+  private async analyzeAndStore(
+    source: MemoryRow,
+    rawTurn: RawTurnRecord,
+    job: EvolutionJobRecord
+  ): Promise<string[]> {
     const result = await this.deps.llm.completeJson<{
       reason?: unknown;
       spans?: unknown;
@@ -108,14 +166,16 @@ export class BigTurnSpanPipeline {
       maxTokens: 4096
     });
     const spans = validateSpanResult(result, rawTurn.toolCalls.length);
-    if (!spans) return;
+    if (!spans) return [];
+    let spanIds: string[] = [];
     this.deps.repos.transaction(() => {
-      const spanIds: string[] = [];
+      spanIds = [];
       for (const [spanIndex, span] of spans.entries()) {
         spanIds.push(this.storeSpan({ source, rawTurn, job, span, spanIndex }));
       }
       this.linkSpansToSourceTrace(source.id, spanIds, job);
     });
+    return spanIds;
   }
 
   private storeSpan(input: {

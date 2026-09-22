@@ -164,7 +164,7 @@ describe("MemoryService / evolution / skill cluster", () => {
     expect(cluster.meta_skill_md).toContain("anti_pattern");
   });
 
-  it("enqueues assign/evolve after episode reward without a manual skill job", async () => {
+  it("does not enqueue Direct Skill clustering after episode reward", async () => {
     const calls: Array<{ operation: string }> = [];
     const { db, service } = createTestService({
       llm: createDirectSkillLlm(calls),
@@ -236,22 +236,14 @@ describe("MemoryService / evolution / skill cluster", () => {
       `SELECT r_task FROM episodes WHERE id = ?`
     ).get(complete.episodeId) as { r_task: number | null };
     expect(rewarded.r_task).toBe(1);
-    expect(jobs.map((job) => job.job_type)).toEqual([
-      "skill_cluster_assign",
-      "skill_batch_evolve"
-    ]);
-    expect(jobs.every((job) => job.status === "succeeded")).toBe(true);
+    expect(jobs).toEqual([]);
     const skill = db.db.prepare(
       `SELECT id, properties_json
        FROM memories
        WHERE memory_layer = 'Skill'`
     ).get() as { id: string; properties_json: string } | undefined;
-    expect(skill).toBeTruthy();
-    const properties = JSON.parse(skill!.properties_json) as {
-      internal_info?: { source?: string };
-    };
-    expect(properties.internal_info?.source).toBe(DIRECT_SKILL_SOURCE);
-    expect(calls.map((item) => item.operation)).toContain("skill.batch_evolve.crystallize");
+    expect(skill).toBeUndefined();
+    expect(calls.map((item) => item.operation)).not.toContain("skill.batch_evolve.crystallize");
   });
 
   it("does not create a Skill from failure-only evidence", async () => {

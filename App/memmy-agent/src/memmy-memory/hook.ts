@@ -331,6 +331,9 @@ export class MemmyMemoryHook extends AgentHook implements MemmyMemoryToolRuntime
           toolResults,
           sourceMemoryIds: turn.sourceMemoryIds,
           usage: result?.usage ?? ctx.usage,
+          directSkillInterventions: Array.isArray(result?.directSkillInterventions)
+            ? result.directSkillInterventions
+            : undefined,
           status,
         }));
         turn.rawTurnId = stringOrUndefined(response?.rawTurnId) ?? turn.rawTurnId;

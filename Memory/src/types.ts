@@ -5,6 +5,7 @@ import type {
   WorkspaceHostId,
   WorkspaceUri
 } from "./contracts/index.js";
+import type { DirectSkillPackage } from "./algorithm/direct-skill/types.js";
 
 export type {
   L3WorldModelBoundaryRequest,
@@ -192,6 +193,7 @@ export interface MemoryFilter {
   memoryLayer?: MemoryLayer | MemoryLayer[];
   status?: MemoryStatus | MemoryStatus[];
   tags?: string[];
+  excludedTags?: string[];
   ids?: string[];
   memoryKind?: MemoryKind | MemoryKind[];
   workMemoryUserId?: string;
@@ -361,10 +363,19 @@ export interface TurnCompleteRequest extends RequestEnvelope {
   sourceMemoryIds?: string[];
   usage?: Record<string, unknown>;
   status?: "succeeded" | "failed" | "cancelled";
+  directSkillInterventions?: DirectSkillInterventionLog[];
   userMemoryCorrection?: {
     targetMemoryId: string;
     revisedContent: string;
   };
+}
+
+export interface DirectSkillInterventionLog {
+  taskKey: string;
+  packageId: string;
+  eventTypes: DirectSkillRetrievalEventType[];
+  moduleIds: string[];
+  injectedAt: string;
 }
 
 /** A completed native source turn; channel is deliberately excluded from its identity. */
@@ -485,6 +496,46 @@ export interface MemorySearchRequest extends RequestEnvelope {
   contextBudget?: number;
   includeInjectedContext?: boolean;
   verbose?: boolean;
+}
+
+export type DirectSkillRetrievalEventType =
+  | "turn_start"
+  | "tool_error"
+  | "no_progress"
+  | "before_submit";
+
+export interface DirectSkillRuntimeEventBatch {
+  eventTypes: DirectSkillRetrievalEventType[];
+  occurredAt: string;
+  toolCalls?: Record<string, unknown>[];
+  toolResults?: unknown[];
+  toolEvents?: Record<string, unknown>[];
+  draftFinalAnswer?: string;
+  observations?: Record<string, unknown>;
+}
+
+export interface RouteDirectSkillPackageRequest extends RequestEnvelope {
+  query: string;
+  toolNames: string[];
+  workspace?: string;
+}
+
+export interface RouteDirectSkillPackageResponse {
+  package: DirectSkillPackage | null;
+}
+
+export interface SelectDirectSkillModulesRequest extends RequestEnvelope {
+  packageId: string;
+  candidateModuleIds: string[];
+  event: DirectSkillRuntimeEventBatch;
+  taskMessages: Record<string, unknown>[];
+  draftFinalAnswer?: string;
+}
+
+export interface SelectDirectSkillModulesResponse {
+  packageId: string;
+  selectedModuleIds: string[];
+  reason: string;
 }
 
 export interface MemoryAddRequest extends RequestEnvelope {

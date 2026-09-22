@@ -33,6 +33,7 @@ import {
 } from "../../algorithm/trace-direct-skill.js";
 import {
   MEMORY_SUMMARY_MAX_TOKENS,
+  type DirectSkillMode,
   type MemmyConfig
 } from "../../config/index.js";
 import { createMemoryLogger, memoryErrorFields } from "../../logging/logger.js";
@@ -114,6 +115,16 @@ const ONBOARDING_FIRST_REPORT_AGENT_ID = "memmy-onboarding";
 const ONBOARDING_FIRST_REPORT_TAG = "first-encounter-report";
 
 const ONBOARDING_FIRST_REPORT_MAX_SNIPPET_BODY_CHARS = 5_000;
+
+const DIRECT_TRACE_SKILL_TAG = "direct-trace";
+
+export const DIRECT_SKILL_PACKAGE_TAG = "direct-skill-package";
+
+export function directSkillExcludedTags(mode: DirectSkillMode): string[] {
+  return mode === "legacy"
+    ? [DIRECT_SKILL_PACKAGE_TAG]
+    : [DIRECT_TRACE_SKILL_TAG, DIRECT_SKILL_PACKAGE_TAG];
+}
 
 const pipelineLogger = createMemoryLogger("pipeline");
 
@@ -1838,6 +1849,7 @@ export class RetrievalService {
     const semanticLayers = dynamicCurrentQuery
       ? requestedSemanticLayers.filter((layer) => layer !== "L1")
       : requestedSemanticLayers;
+    const excludedTags = directSkillExcludedTags(this.deps.config.algorithm.skill.directMode);
     const searchAt = Date.now();
     const includeUserMemory = !onboardingFirstReportHit && semanticLayers.includes("L1");
     const userMemoryCount = includeUserMemory
@@ -1851,6 +1863,7 @@ export class RetrievalService {
           userId: context.userId,
           layers: semanticLayers,
           tags: request.tags,
+          excludedTags,
           projectId: context.namespace.projectId?.trim() || null
         }) + userMemoryCount;
     const retrievalQuery = focusResearchRetrievalQuery(request.query, tuning.domain).text;
@@ -1885,6 +1898,7 @@ export class RetrievalService {
           queryExtract,
           layers,
           tags: request.tags,
+          excludedTags,
           limit: agentLaneLimit,
           mode: retrievalMode,
           excludeTraceRawTurnIds: recentRawTurnIds,
@@ -2197,6 +2211,7 @@ export class RetrievalService {
     queryExtract: RetrievalQueryExtract | null;
     layers: MemoryLayer[];
     tags?: string[];
+    excludedTags?: string[];
     limit: number;
     mode: RetrievalMode;
     excludeTraceRawTurnIds?: ReadonlySet<string>;
@@ -2219,6 +2234,7 @@ export class RetrievalService {
         userId: input.userId,
         layers: input.layers,
         tags: input.tags,
+        excludedTags: input.excludedTags,
         projectId: input.projectId
       });
       const queryVector = hasVectorCandidates ? await this.queryVector(queryVectorText) : undefined;
@@ -2229,6 +2245,7 @@ export class RetrievalService {
         layers: input.layers,
         projectId: input.projectId,
         tags: input.tags,
+        excludedTags: input.excludedTags,
         targetSkillId: input.targetSkillId,
         currentAgentId: input.currentAgentId,
         config

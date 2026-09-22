@@ -9,7 +9,15 @@ export function resolveMemmyMemoryConfig(config: Config | Record<string, any> | 
     enabled: Boolean(raw?.enabled ?? raw?.enable ?? true),
     userId: stringOrUndefined(raw?.userId) ?? "local-user",
     retrievalLayers: memoryLayersOrUndefined(raw?.retrievalLayers),
+    directMode: directMode(raw?.algorithm?.skill),
   };
+}
+
+function directMode(skill: any): MemmyMemoryResolvedConfig["directMode"] {
+  const explicit = skill?.directMode;
+  if (explicit === "legacy" || explicit === "package_v1" || explicit === "off") return explicit;
+  if (skill?.directFromTrace === true) return "legacy";
+  return "off";
 }
 
 function stringOrUndefined(value: any): string | undefined {

@@ -60,6 +60,7 @@
     "memory:serve:local": "npm run serve:local -w @memmy/memory",
     "memory:serve:dev": "npm run serve:dev -w @memmy/memory",
     "memory:worker:run": "npm run worker:run -w @memmy/memory",
+    "direct-skill:build": "tsx Memory/src/cli/index.ts direct-skill build",
     "memory:test": "npm run test -w @memmy/memory",
     "agent:test:tui-cursor": "npm --prefix App/memmy-agent run test:tui-cursor",
     "memory:lint": "npm run typecheck -w @memmy/memory",

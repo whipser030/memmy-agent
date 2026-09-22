@@ -46,6 +46,7 @@ import {
 import { renderTemplate } from "../../utils/prompt-templates.js";
 import type { TurnCancellationBoundary } from "./turn-cancellation-boundary.js";
 import { resolveToolResultMaxChars, type ToolResultMaxCharsByName } from "./tool-result-budget.js";
+import type { DirectSkillInjection, DirectSkillIntervention } from "../../direct-skill-runtime/types.js";
 
 const DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model.";
 const PERSISTED_MODEL_ERROR_PLACEHOLDER = "[Assistant reply unavailable due to model error.]";
@@ -165,6 +166,7 @@ export class AgentRunSpec {
   retryWaitCallback?: any;
   checkpointCallback?: ((payload: Record<string, any>) => Promise<void> | void) | null;
   injectionCallback?: ((opts?: { limit?: number }) => Promise<any[]> | any[]) | null;
+  injectionEnqueueCallback?: ((payload: DirectSkillInjection) => boolean) | null;
   llmTimeoutS?: number | null;
   abortSignal?: AbortSignal | null;
   turnId?: string | null;
@@ -204,6 +206,7 @@ export class AgentRunSpec {
     retryWaitCallback?: any;
     checkpointCallback?: ((payload: Record<string, any>) => Promise<void> | void) | null;
     injectionCallback?: ((opts?: { limit?: number }) => Promise<any[]> | any[]) | null;
+    injectionEnqueueCallback?: ((payload: DirectSkillInjection) => boolean) | null;
     llmTimeoutS?: number | null;
     abortSignal?: AbortSignal | null;
     turnId?: string | null;
@@ -241,6 +244,7 @@ export class AgentRunSpec {
     this.retryWaitCallback = init.retryWaitCallback ?? null;
     this.checkpointCallback = init.checkpointCallback ?? null;
     this.injectionCallback = init.injectionCallback ?? null;
+    this.injectionEnqueueCallback = init.injectionEnqueueCallback ?? null;
     this.llmTimeoutS = init.llmTimeoutS ?? null;
     this.abortSignal = init.abortSignal ?? null;
     this.turnId = init.turnId ?? null;
@@ -267,6 +271,7 @@ export class AgentRunResult {
   finishReason: string;
   error: string | null;
   hadInjections: boolean;
+  directSkillInterventions: DirectSkillIntervention[];
 
   constructor(init: {
     finalContent?: string | null;
@@ -282,6 +287,7 @@ export class AgentRunResult {
     finishReason?: string;
     error?: string | null;
     hadInjections?: boolean;
+    directSkillInterventions?: DirectSkillIntervention[];
   }) {
     const response = init.response ?? new LLMResponse({ content: init.content ?? init.finalContent ?? "" });
     this.finalContent = init.finalContent ?? init.content ?? response.content ?? "";
@@ -297,6 +303,7 @@ export class AgentRunResult {
     this.finishReason = init.finishReason ?? response.finishReason;
     this.error = init.error ?? null;
     this.hadInjections = init.hadInjections ?? false;
+    this.directSkillInterventions = init.directSkillInterventions ?? [];
   }
 }
 
@@ -370,6 +377,9 @@ export class AgentRunner {
           ...(item.webui_queue_steer_recovery
             ? { webui_queue_steer_recovery: structuredClone(item.webui_queue_steer_recovery) }
             : {}),
+          ...(item.direct_skill_intervention
+            ? { direct_skill_intervention: structuredClone(item.direct_skill_intervention) }
+            : {}),
         });
       } else {
         const text = String(item?.content ?? item ?? "");
@@ -385,6 +395,7 @@ export class AgentRunner {
     assistantMessage: Record<string, any> | null,
     injectionCycles: number,
     opts: { phase?: string; iteration?: number | null } = {},
+    directSkillInterventions: DirectSkillIntervention[] = [],
   ): Promise<[boolean, number]> {
     let injections: Record<string, any>[] = [];
     let realInjection = false;
@@ -394,6 +405,15 @@ export class AgentRunner {
     }
     if (!injections.length) return [false, injectionCycles];
     if (realInjection) injectionCycles += 1;
+    for (const injection of injections) {
+      const intervention = injection.direct_skill_intervention;
+      if (intervention && typeof intervention === "object") {
+        directSkillInterventions.push({
+          ...(structuredClone(intervention) as DirectSkillIntervention),
+          injectedAt: new Date().toISOString(),
+        });
+      }
+    }
     if (assistantMessage) {
       messages.push(assistantMessage);
       if (opts.iteration != null) {
@@ -422,6 +442,7 @@ export class AgentRunner {
         delete providerMessage.turn_source;
         delete providerMessage.webui_queue_steer_origin;
         delete providerMessage.webui_queue_steer_recovery;
+        delete providerMessage.direct_skill_intervention;
         return providerMessage;
       }),
       tools,
@@ -1038,12 +1059,16 @@ export class AgentRunner {
     const hint = "\n\n[Analyze the error above and try a different approach.]";
     if (spec.abortSignal?.aborted) {
       const event = { name: call.name, status: "error", detail: "task cancelled" };
-      return { call, result: "Error: task cancelled", event, error: spec.failOnToolError ? createAbortError() : null };
+      const result = "Error: task cancelled";
+      await spec.hook?.afterToolCall(new AgentHookContext({ spec, toolCalls: [call], toolResults: [result], toolEvents: [event] }), call, result);
+      return { call, result, event, error: spec.failOnToolError ? createAbortError() : null };
     }
     const repeatedLookup = repeatedExternalLookupError(call.name, call.arguments, externalLookupCounts);
     if (repeatedLookup) {
       const event = { name: call.name, status: "error", detail: "repeated external lookup blocked" };
-      return { call, result: repeatedLookup + hint, event, error: spec.failOnToolError ? new Error(repeatedLookup) : null };
+      const result = repeatedLookup + hint;
+      await spec.hook?.afterToolCall(new AgentHookContext({ spec, toolCalls: [call], toolResults: [result], toolEvents: [event] }), call, result);
+      return { call, result, event, error: spec.failOnToolError ? new Error(repeatedLookup) : null };
     }
 
     const prepare = spec.tools?.prepareCall;
@@ -1061,8 +1086,13 @@ export class AgentRunner {
     if (prepError) {
       const event = { name: call.name, status: "error", detail: eventDetail("", prepError, 120) };
       const handled = this.classifyViolation(prepError, prepError + hint, event, call, workspaceViolationCounts);
-      if (handled) return { call, ...handled };
-      return { call, result: prepError + hint, event, error: spec.failOnToolError ? new Error(prepError) : null };
+      if (handled) {
+        await spec.hook?.afterToolCall(new AgentHookContext({ spec, toolCalls: [call], toolResults: [handled.result], toolEvents: [handled.event] }), call, handled.result);
+        return { call, ...handled };
+      }
+      const result = prepError + hint;
+      await spec.hook?.afterToolCall(new AgentHookContext({ spec, toolCalls: [call], toolResults: [result], toolEvents: [event] }), call, result);
+      return { call, result, event, error: spec.failOnToolError ? new Error(prepError) : null };
     }
 
     const progressCallback = spec.progressCallback && onProgressAcceptsFileEditEvents(spec.progressCallback)
@@ -1080,7 +1110,9 @@ export class AgentRunner {
       : [];
     if (spec.abortSignal?.aborted) {
       const event = { name: call.name, status: "error", detail: "task cancelled" };
-      return { call, result: "Error: task cancelled", event, error: spec.failOnToolError ? createAbortError() : null };
+      const result = "Error: task cancelled";
+      await spec.hook?.afterToolCall(new AgentHookContext({ spec, toolCalls: [call], toolResults: [result], toolEvents: [event] }), call, result);
+      return { call, result, event, error: spec.failOnToolError ? createAbortError() : null };
     }
     if (progressCallback && fileEditTrackers.length) {
       await invokeFileEditProgress(
@@ -1162,8 +1194,20 @@ export class AgentRunner {
       }
       const event = { name: call.name, status: "error", detail: eventDetail("", message, 120) };
       const handled = this.classifyViolation(String((error as Error).message ?? error), message, event, call, workspaceViolationCounts);
-      if (handled) return { call, ...handled, ...(stopTurn ? { stopTurn } : {}) };
+      if (handled) {
+        await spec.hook?.afterToolCall(
+          new AgentHookContext({ spec, toolCalls: [call], toolResults: [handled.result], toolEvents: [handled.event] }),
+          call,
+          handled.result,
+        );
+        return { call, ...handled, ...(stopTurn ? { stopTurn } : {}) };
+      }
       const result = this.normalizeToolResult(spec, call.id, call.name, message);
+      await spec.hook?.afterToolCall(
+        new AgentHookContext({ spec, toolCalls: [call], toolResults: [result], toolEvents: [event] }),
+        call,
+        result,
+      );
       return { call, result, event, error: spec.failOnToolError ? error : null, ...(stopTurn ? { stopTurn } : {}) };
     }
   }
@@ -1510,6 +1554,7 @@ export class AgentRunner {
     let lengthRecoveries = 0;
     let injectionCycles = 0;
     let hadInjections = false;
+    const directSkillInterventions: DirectSkillIntervention[] = [];
     const imageTextState: TurnImageTextState = {
       nextImageNumber: 1,
       nextBatchId: 1,
@@ -1519,7 +1564,32 @@ export class AgentRunner {
     let modelContextProjection: ModelContextProjection | null = null;
 
     const runCtx = new AgentHookContext({ spec, messages });
-    await hook.beforeRun(runCtx);
+    const enqueueCallback = spec.injectionEnqueueCallback;
+    let beforeRunEnqueued = false;
+    if (enqueueCallback) {
+      spec.injectionEnqueueCallback = (payload) => {
+        const accepted = enqueueCallback(payload);
+        if (accepted) beforeRunEnqueued = true;
+        return accepted;
+      };
+    }
+    try {
+      await hook.beforeRun(runCtx);
+    } finally {
+      spec.injectionEnqueueCallback = enqueueCallback;
+    }
+    if (beforeRunEnqueued) {
+      const [drainedAtStart, startCycles] = await this.tryDrainInjections(
+        spec,
+        messages,
+        null,
+        injectionCycles,
+        { phase: "before first model request" },
+        directSkillInterventions,
+      );
+      injectionCycles = startCycles;
+      if (drainedAtStart) hadInjections = true;
+    }
 
     for (let iteration = 0; iteration < spec.maxIterations; iteration += 1) {
       if (spec.abortSignal?.aborted) {
@@ -1663,6 +1733,7 @@ export class AgentRunner {
           break;
         }
         const fatal = executed.find((item) => item.error)?.error;
+        await hook.afterToolBatch(context);
         if (fatal) {
           error = `Error: ${fatal.constructor?.name ?? "Error"}: ${fatal.message ?? fatal}`;
           finalContent = error;
@@ -1672,7 +1743,7 @@ export class AgentRunner {
           context.error = error;
           context.stopReason = stopReason;
           await hook.afterIteration(context);
-          const [shouldContinue, cycles] = await this.tryDrainInjections(spec, messages, null, injectionCycles, { phase: "after tool error" });
+          const [shouldContinue, cycles] = await this.tryDrainInjections(spec, messages, null, injectionCycles, { phase: "after tool error" }, directSkillInterventions);
           injectionCycles = cycles;
           if (shouldContinue) {
             hadInjections = true;
@@ -1690,7 +1761,7 @@ export class AgentRunner {
         });
         emptyContentRetries = 0;
         lengthRecoveries = 0;
-        const [drained, cycles] = await this.tryDrainInjections(spec, messages, null, injectionCycles, { phase: "after tool execution" });
+        const [drained, cycles] = await this.tryDrainInjections(spec, messages, null, injectionCycles, { phase: "after tool execution" }, directSkillInterventions);
         injectionCycles = cycles;
         if (drained) hadInjections = true;
         await hook.afterIteration(context);
@@ -1747,10 +1818,14 @@ export class AgentRunner {
       const terminalImageError = AgentRunner.terminalImageError(response);
       let shouldContinue = false;
       if (!terminalImageError) {
+        if (assistant && response.finishReason !== "length") {
+          context.finalContent = clean;
+          await hook.beforeFinalResponse(context);
+        }
         const [drained, cycles] = await this.tryDrainInjections(spec, messages, assistant, injectionCycles, {
           phase: "after final response",
           iteration,
-        });
+        }, directSkillInterventions);
         shouldContinue = drained;
         injectionCycles = cycles;
         if (shouldContinue) hadInjections = true;
@@ -1773,7 +1848,7 @@ export class AgentRunner {
         context.stopReason = stopReason;
         await hook.afterIteration(context);
         if (terminalImageError) break;
-        const [drained, nextCycles] = await this.tryDrainInjections(spec, messages, null, injectionCycles, { phase: "after LLM error" });
+        const [drained, nextCycles] = await this.tryDrainInjections(spec, messages, null, injectionCycles, { phase: "after LLM error" }, directSkillInterventions);
         injectionCycles = nextCycles;
         if (drained) {
           hadInjections = true;
@@ -1791,7 +1866,7 @@ export class AgentRunner {
         context.error = error;
         context.stopReason = stopReason;
         await hook.afterIteration(context);
-        const [drained, nextCycles] = await this.tryDrainInjections(spec, messages, null, injectionCycles, { phase: "after empty response" });
+        const [drained, nextCycles] = await this.tryDrainInjections(spec, messages, null, injectionCycles, { phase: "after empty response" }, directSkillInterventions);
         injectionCycles = nextCycles;
         if (drained) {
           hadInjections = true;
@@ -1923,7 +1998,7 @@ export class AgentRunner {
       } else {
         finalContent = fallback;
         AgentRunner.appendFinalMessage(messages, finalContent);
-        const [drained, cycles] = await this.tryDrainInjections(spec, messages, null, injectionCycles, { phase: "after maxIterations" });
+        const [drained, cycles] = await this.tryDrainInjections(spec, messages, null, injectionCycles, { phase: "after maxIterations" }, directSkillInterventions);
         injectionCycles = cycles;
         if (drained) hadInjections = true;
       }
@@ -1942,6 +2017,7 @@ export class AgentRunner {
       stopReason,
       error,
       hadInjections,
+      directSkillInterventions,
     });
     await hook.afterRun(runCtx, result);
     return result;
