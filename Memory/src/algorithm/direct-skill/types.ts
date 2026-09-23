@@ -86,8 +86,10 @@ export type SpanModuleExtractionResult =
   | { decision: "reject"; reason: string }
   | {
       decision: "accept";
-      material: ModuleMaterial;
-      candidateModule: CandidateModuleRecord;
+      modules: Array<{
+        material: ModuleMaterial;
+        candidateModule: CandidateModuleRecord;
+      }>;
     };
 
 export interface StrengthVote {
@@ -140,5 +142,13 @@ export interface DirectSkillExtractionSource {
   assistantFinalAnswer: string;
   subgoal: string;
   summary: string;
-  toolCalls: unknown[];
+  toolSteps: Array<{
+    evidenceRef: string;
+    call: unknown;
+    result: unknown;
+  }>;
+  evaluation: {
+    rTask: number;
+    detail: Record<string, unknown>;
+  };
 }

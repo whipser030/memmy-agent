@@ -93,7 +93,9 @@ export class DirectSkillRetrievalService {
         content: [
           "Select at most one Direct Skill Package for the current task.",
           "Return JSON only: {\"packageId\": string|null}.",
-          "Choose only a listed packageId. Return null when none is clearly relevant."
+          "Choose only a listed packageId. Return null when none is clearly relevant.",
+          "A package may be relevant as execution or pre-submit guidance even when the user does not explicitly ask for that verification step.",
+          "Judge applicability from the module instruction, scope, and trigger events; do not require title words to appear in the task."
         ].join("\n")
       },
       {
@@ -105,7 +107,13 @@ export class DirectSkillRetrievalService {
           candidates: candidates.map((candidate) => ({
             packageId: candidate.packageId,
             title: candidate.title,
-            summary: candidate.summary
+            summary: candidate.summary,
+            modules: candidate.modules.map((module) => ({
+              type: module.type,
+              instruction: module.instruction,
+              scope: module.scope,
+              triggerEvents: module.triggerEvents
+            }))
           }))
         })
       }

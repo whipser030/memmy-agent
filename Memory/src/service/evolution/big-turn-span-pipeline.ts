@@ -82,8 +82,69 @@ export type DirectSkillSegmentationResult =
   | { mode: "single_goal"; rawTurnId: string }
   | { mode: "multi_goal"; rawTurnId: string; spanIds: string[] };
 
+export interface DirectSkillTrajectorySpan {
+  spanId: string;
+  start: number;
+  end: number;
+  spanGoal: string;
+  summary: string;
+}
+
+export type DirectSkillTrajectorySegmentation =
+  | { mode: "single_goal"; rawTurnId: string; spans: [] }
+  | { mode: "multi_goal"; rawTurnId: string; spans: DirectSkillTrajectorySpan[] };
+
 export class BigTurnSpanPipeline {
   constructor(private readonly deps: BigTurnSpanDeps) {}
+
+  async segmentTrajectoryForDirectSkill(input: {
+    rawTurnId: string;
+    episodeId: string;
+    rTask?: number;
+    rewardReason?: string;
+    at?: string;
+  }): Promise<DirectSkillTrajectorySegmentation> {
+    const rawTurn = this.deps.repos.runtime.getRawTurn(input.rawTurnId);
+    if (!rawTurn) throw new Error(`direct-skill Raw Turn not found: ${input.rawTurnId}`);
+    if (rawTurn.episodeId !== input.episodeId) {
+      throw new Error(`direct-skill Raw Turn ${rawTurn.id} does not belong to Episode ${input.episodeId}`);
+    }
+    const stored = storedDirectSkillSegmentation(rawTurn);
+    if (stored) return stored;
+
+    const at = input.at ?? new Date().toISOString();
+    if (rawTurn.toolCalls.length < SPAN_BIG_TURN_MIN_TOOL_CALLS) {
+      return this.storeDirectSkillSegmentation(rawTurn, [], at, "tool_call_count_below_threshold");
+    }
+    if (!SPAN_BIG_TURN_ENABLED || !this.deps.llm.isConfigured()) {
+      throw new Error("direct-skill long-turn segmentation requires a configured LLM");
+    }
+    const result = await this.deps.llm.completeJson<{
+      reason?: unknown;
+      spans?: unknown;
+    }>([
+      { role: "system", content: SPAN_BIG_TURN_PROMPT },
+      {
+        role: "user",
+        content: stableStringify(bigTurnPromptPayload(undefined, rawTurn, {
+          rTask: input.rTask,
+          rewardReason: input.rewardReason ?? "direct-skill offline build"
+        }))
+      }
+    ], {
+      operation: SPAN_BIG_TURN_OPERATION,
+      thinkingMode: "disabled",
+      temperature: 0.6,
+      maxTokens: 4096
+    });
+    const drafts = validateSpanResult(result, rawTurn.toolCalls.length) ?? [];
+    return this.storeDirectSkillSegmentation(
+      rawTurn,
+      drafts,
+      at,
+      text(result.reason) ?? (drafts.length ? "multi_goal" : "single_coherent_goal")
+    );
+  }
 
   async splitAndStore(job: EvolutionJobRecord): Promise<void> {
     if (!SPAN_BIG_TURN_ENABLED || !this.deps.llm.isConfigured()) return;
@@ -143,6 +204,33 @@ export class BigTurnSpanPipeline {
     return spanIds.length === 0
       ? { mode: "single_goal", rawTurnId: rawTurn.id }
       : { mode: "multi_goal", rawTurnId: rawTurn.id, spanIds };
+  }
+
+  private storeDirectSkillSegmentation(
+    rawTurn: RawTurnRecord,
+    drafts: SpanDraft[],
+    at: string,
+    reason: string
+  ): DirectSkillTrajectorySegmentation {
+    const spans = drafts.map((span) => ({
+      spanId: `span_${stableHash(`${rawTurn.id}:${span.start}:${span.end}`).slice(0, 20)}`,
+      ...span
+    }));
+    this.deps.repos.runtime.updateRawTurn({
+      ...rawTurn,
+      messagePayload: {
+        ...(rawTurn.messagePayload ?? {}),
+        direct_skill_span_segmentation: {
+          mode: spans.length ? "multi_goal" : "single_goal",
+          reason,
+          created_at: at,
+          spans
+        }
+      }
+    });
+    return spans.length
+      ? { mode: "multi_goal", rawTurnId: rawTurn.id, spans }
+      : { mode: "single_goal", rawTurnId: rawTurn.id, spans: [] };
   }
 
   private async analyzeAndStore(
@@ -320,23 +408,24 @@ function spanId(sourceTraceId: string, span: SpanDraft): string {
 }
 
 function bigTurnPromptPayload(
-  source: MemoryRow,
+  source: MemoryRow | undefined,
   rawTurn: RawTurnRecord,
-  job: EvolutionJobRecord
+  job: EvolutionJobRecord | { rTask?: number; rewardReason?: string }
 ): Record<string, unknown> {
-  const internal = source.properties.internal_info;
+  const internal: Record<string, unknown> = source?.properties.internal_info ?? {};
   const trace = isRecord(internal.trace) ? internal.trace : {};
   const traceTimestamp = number(trace.ts);
   const traceTimeZone = text(trace.time_zone);
   return {
-    sourceTraceId: redactSensitiveText(source.id),
+    sourceTraceId: source ? redactSensitiveText(source.id) : undefined,
+    trajectoryId: redactSensitiveText(rawTurn.id),
     capturedAt: traceTimestamp === undefined
       ? undefined
       : formatZonedTime(traceTimestamp, traceTimeZone),
     userRequest: redactAndClip(rawTurn.userText ?? "", 2_000),
     assistantFinalAnswer: redactAndClip(rawTurn.assistantText ?? "", 2_000),
     traceSummary: redactAndClip(
-      text(trace.summary) ?? text(source.info.summary) ?? "",
+      text(trace.summary) ?? text(source?.info.summary) ?? "",
       1_000
     ),
     reflection: redactAndClip(
@@ -344,8 +433,8 @@ function bigTurnPromptPayload(
       1_000
     ),
     reward: {
-      rTask: number(job.payload.rTask),
-      reason: redactAndClip(text(job.payload.rewardReason) ?? "", 600)
+      rTask: number("payload" in job ? job.payload.rTask : job.rTask),
+      reason: redactAndClip(text("payload" in job ? job.payload.rewardReason : job.rewardReason) ?? "", 600)
     },
     toolCalls: rawTurn.toolCalls.map((call, index) => isToolCall(call)
       ? {
@@ -361,6 +450,25 @@ function bigTurnPromptPayload(
           raw: redactAndClip(stableStringify(call), 100)
         })
   };
+}
+
+function storedDirectSkillSegmentation(rawTurn: RawTurnRecord): DirectSkillTrajectorySegmentation | undefined {
+  const stored = rawTurn.messagePayload?.direct_skill_span_segmentation;
+  if (!isRecord(stored) || !Array.isArray(stored.spans)) return undefined;
+  const spans: DirectSkillTrajectorySpan[] = [];
+  for (const value of stored.spans) {
+    if (!isRecord(value)) return undefined;
+    const spanIdValue = text(value.spanId);
+    const start = integer(value.start);
+    const end = integer(value.end);
+    const spanGoal = text(value.spanGoal);
+    const summary = text(value.summary);
+    if (!spanIdValue || start === undefined || end === undefined || !spanGoal || !summary) return undefined;
+    spans.push({ spanId: spanIdValue, start, end, spanGoal, summary });
+  }
+  return spans.length
+    ? { mode: "multi_goal", rawTurnId: rawTurn.id, spans }
+    : { mode: "single_goal", rawTurnId: rawTurn.id, spans: [] };
 }
 
 function redactAndClip(value: string, maxChars: number): string {

@@ -14,6 +14,7 @@ const PACKAGE_CONSOLIDATION_PROMPT = `Organize all graded modules in one skill p
 mergeGroups may merge modules only when semanticKey, type, and strength are equal and scope plus execution contract are compatible.
 alternativeGroups identify solutions to a similar problem that cannot be used together. Do not merge alternatives.
 Every alternative member must reference either a merge group ID or an unmerged candidate module ID.
+Omit merge or alternative groups that contain fewer than two distinct members.
 Do not invent, delete, or rewrite modules.
 
 Return JSON only:
@@ -106,7 +107,9 @@ function buildFinalModules(
   const modules: DirectSkillModule[] = [];
 
   for (const group of mergeGroups) {
-    if (group.candidateModuleIds.length < 2) throw new Error(`direct-skill merge group ${group.groupId} must have at least two members`);
+    // A singleton merge proposed by the organizer is a no-op. Keep its
+    // candidate unmerged rather than failing the complete Package build.
+    if (group.candidateModuleIds.length < 2) continue;
     const members = group.candidateModuleIds.map((id) => {
       const candidate = byId.get(id);
       if (!candidate) throw new Error(`direct-skill merge group references unknown module: ${id}`);
@@ -144,7 +147,7 @@ function buildFinalModules(
 
   const assignedAlternative = new Set<string>();
   for (const group of alternativeGroups) {
-    if (group.memberRefs.length < 2) throw new Error(`direct-skill alternative group ${group.groupKey} must have at least two members`);
+    if (group.memberRefs.length < 2) continue;
     for (const ref of group.memberRefs) {
       const members = unitToModules.get(ref);
       if (!members) throw new Error(`direct-skill alternative group references unknown unit: ${ref}`);

@@ -13,13 +13,23 @@ import {
   type SpanModuleExtractionResult
 } from "./types.js";
 
-const MODULE_EXTRACTION_PROMPT = `Extract one reusable, task-relevant module from one trajectory span or one coherent turn.
+const MODULE_EXTRACTION_PROMPT = `Extract all materially distinct, reusable, task-relevant modules from one trajectory span or one coherent turn.
 
 Reject content that does not directly affect how the task is executed, verified, repaired, or submitted.
 Use only the supplied trajectory. Never invent requirements, actions, results, or authority.
-Return exactly one material and exactly one candidateModule when accepted.
-The candidate evidenceRefs must refer only to the supplied source ID or its tool-call references.
-An authorityEvidence statement must be copied from the supplied trajectory and must cite one supplied evidence reference.
+Each accepted module must satisfy at least one memory-strength definition:
+- L1-worthy: task-relevant direction or background from which the agent can derive an action.
+- L2-worthy: explicit executable advice or warning.
+- L3-worthy: a trace-observable execution contract with trigger, action, completion rule, evidence, and recovery.
+- L4-worthy: an authoritative hard task constraint explicitly present in the trajectory, with violation and recovery/stop behavior.
+Do not assign a strength; a separate voter does that. Do not extract narration, incidental commands, sample-specific values, or duplicates.
+Keep instruction, completionRule, requiredEvidence, and recovery reusable: never copy current row numbers, totals, file paths, or record identifiers into those fields.
+For a coherent turn, prioritize the core solution that caused task success, then distinct verification, invariant, repair, avoidance, or fast-path knowledge. Multiple modules are allowed.
+Each toolSteps entry contains the call, its result, and its exact evidenceRef. Copy that evidenceRef verbatim; do not invent or renumber evidence references.
+Official evaluation confirms the overall task outcome only; do not claim it proves an action that is absent from the trace.
+Each candidate evidenceRefs must refer only to the supplied source ID, a supplied tool-call id, or sourceId:tool:<zero-based-index>.
+Set authorityEvidence only when that candidateModule.authority is task_hard_constraint; otherwise return null.
+For a hard constraint, copy authorityEvidence.statement verbatim from the supplied trajectory and cite one supplied evidence reference.
 
 Module type is one of: tactic, fast_path, avoidance, verification, repair, invariant.
 When the supplied trajectory outcome is failure, candidateModule.type must be avoidance, repair, verification, or invariant; failure evidence cannot support tactic or fast_path.
@@ -31,18 +41,20 @@ Return JSON only:
 {
   "decision": "accept" | "reject",
   "reason": "...",
-  "material": {
-    "subgoal": "...", "outcome": "success|failure|mixed",
-    "observation": "...", "proposedAction": "...", "scopeClues": [],
-    "evidenceRefs": [],
-    "authorityEvidence": { "statement": "...", "evidenceRef": "..." }
-  },
-  "candidateModule": {
-    "semanticKey": "stable_snake_case_key", "type": "...", "instruction": "...",
-    "scope": { "tasks": [], "tools": [], "resources": [], "operations": [] },
-    "triggerEvents": [], "completionRule": "...", "requiredEvidence": [],
-    "recovery": "...", "evidenceRefs": [], "authority": "...", "evidencePattern": "..."
-  }
+  "modules": [{
+    "material": {
+      "subgoal": "...", "outcome": "success|failure|mixed",
+      "observation": "...", "proposedAction": "...", "scopeClues": [],
+      "evidenceRefs": [],
+      "authorityEvidence": null | { "statement": "verbatim source text", "evidenceRef": "..." }
+    },
+    "candidateModule": {
+      "semanticKey": "stable_snake_case_key", "type": "...", "instruction": "...",
+      "scope": { "tasks": [], "tools": [], "resources": [], "operations": [] },
+      "triggerEvents": [], "completionRule": "...", "requiredEvidence": [],
+      "recovery": "...", "evidenceRefs": [], "authority": "...", "evidencePattern": "..."
+    }
+  }]
 }`;
 
 const AUTHORITIES: AuthoritySource[] = [
@@ -85,35 +97,56 @@ export class ModuleExtractor {
         : "direct_skill.module.extract_turn",
       jsonMode: true,
       temperature: 0.2,
-      maxTokens: 4096
+      maxTokens: 8192
     });
     if (result.decision === "reject") {
       return { decision: "reject", reason: requiredText(result.reason, "reject reason") };
     }
     if (result.decision !== "accept") throw new Error("direct-skill extractor returned invalid decision");
-    const material = parseMaterial(result.material, source);
-    const candidate = parseCandidate(result.candidateModule, source, material);
+    if (!Array.isArray(result.modules) || result.modules.length === 0) {
+      throw new Error("direct-skill extractor accepted without modules");
+    }
+    const semanticKeys = new Set<string>();
+    const modules = result.modules.map((value) => {
+      if (!isRecord(value) || !isRecord(value.candidateModule)) {
+        throw new Error("direct-skill extractor returned invalid module entry");
+      }
+      const semanticKey = requiredText(value.candidateModule.semanticKey, "candidateModule.semanticKey");
+      if (semanticKeys.has(semanticKey)) throw new Error(`direct-skill extractor duplicated semanticKey: ${semanticKey}`);
+      semanticKeys.add(semanticKey);
+      const material = parseMaterial(value.material, source, semanticKey);
+      const candidate = parseCandidate(value.candidateModule, source, material);
+      return {
+        material,
+        candidateModule: {
+          ...candidate,
+          moduleId: `dsm_${stableHash(`${source.episodeId}:${source.sourceId}:${candidate.semanticKey}`).slice(0, 20)}`,
+          material
+        }
+      };
+    });
     return {
       decision: "accept",
-      material,
-      candidateModule: {
-        ...candidate,
-        moduleId: `dsm_${stableHash(`${source.episodeId}:${source.sourceId}:${candidate.semanticKey}`).slice(0, 20)}`,
-        material
-      }
+      modules
     };
   }
 }
 
-function parseMaterial(value: unknown, source: DirectSkillExtractionSource): ModuleMaterial {
+function parseMaterial(value: unknown, source: DirectSkillExtractionSource, semanticKey: string): ModuleMaterial {
   if (!isRecord(value)) throw new Error("direct-skill extractor returned invalid material");
-  const evidenceRefs = stringArray(value.evidenceRefs, "material.evidenceRefs");
-  validateEvidenceRefs(evidenceRefs, source);
-  const authorityEvidence = value.authorityEvidence === undefined || value.authorityEvidence === null
-    ? undefined
-    : parseAuthorityEvidence(value.authorityEvidence, source);
+  const evidenceRefs = parseEvidenceRefs(value.evidenceRefs, "material.evidenceRefs", source);
+  let authorityEvidence: ModuleMaterial["authorityEvidence"];
+  if (value.authorityEvidence !== undefined && value.authorityEvidence !== null) {
+    try {
+      authorityEvidence = parseAuthorityEvidence(value.authorityEvidence, source);
+    } catch {
+      // Non-hard modules do not consume authorityEvidence. If the candidate later
+      // claims task_hard_constraint, parseCandidate rejects the missing alignment.
+      authorityEvidence = undefined;
+    }
+  }
   return {
-    materialId: `dsmat_${stableHash(`${source.episodeId}:${source.sourceId}`).slice(0, 20)}`,
+    materialId: `dsmat_${stableHash(`${source.episodeId}:${source.sourceId}:${semanticKey}`).slice(0, 20)}`,
     ...(source.sourceType === "span" ? { spanId: source.sourceId } : { rawTurnId: source.sourceId }),
     episodeId: source.episodeId,
     subgoal: requiredText(value.subgoal, "material.subgoal"),
@@ -136,8 +169,7 @@ function parseCandidate(
   if (!/^[a-z0-9]+(?:_[a-z0-9]+)*$/.test(semanticKey)) {
     throw new Error("direct-skill semanticKey must be stable snake_case");
   }
-  const evidenceRefs = stringArray(value.evidenceRefs, "candidateModule.evidenceRefs");
-  validateEvidenceRefs(evidenceRefs, source);
+  const evidenceRefs = parseEvidenceRefs(value.evidenceRefs, "candidateModule.evidenceRefs", source);
   if (evidenceRefs.some((ref) => !material.evidenceRefs.includes(ref))) {
     throw new Error("direct-skill candidate evidence must be present in its material");
   }
@@ -173,8 +205,11 @@ function parseScope(value: unknown): ModuleScope {
 function parseAuthorityEvidence(value: unknown, source: DirectSkillExtractionSource) {
   if (!isRecord(value)) throw new Error("direct-skill authorityEvidence is invalid");
   const statement = requiredText(value.statement, "authorityEvidence.statement");
-  const evidenceRef = requiredText(value.evidenceRef, "authorityEvidence.evidenceRef");
-  validateEvidenceRefs([evidenceRef], source);
+  const evidenceRef = parseEvidenceRefs(
+    [requiredText(value.evidenceRef, "authorityEvidence.evidenceRef")],
+    "authorityEvidence.evidenceRef",
+    source
+  )[0]!;
   const haystack = stableStringify(source);
   if (!haystack.includes(statement)) {
     throw new Error("direct-skill authority statement is not present in source evidence");
@@ -182,16 +217,24 @@ function parseAuthorityEvidence(value: unknown, source: DirectSkillExtractionSou
   return { statement, evidenceRef };
 }
 
+function parseEvidenceRefs(value: unknown, field: string, source: DirectSkillExtractionSource): string[] {
+  const refs = stringArray(value, field).map((ref) =>
+    ref.startsWith("sourceId:tool:") ? `${source.sourceId}:tool:${ref.slice("sourceId:tool:".length)}` : ref
+  );
+  validateEvidenceRefs(refs, source);
+  return refs;
+}
+
 function validateEvidenceRefs(refs: string[], source: DirectSkillExtractionSource): void {
   if (refs.length === 0) throw new Error("direct-skill evidenceRefs must not be empty");
-  const prefix = `${source.sourceId}:tool:`;
+  const indexedRefs = new Set(source.toolSteps.map((step) => step.evidenceRef));
+  const toolCallIds = new Set(source.toolSteps.flatMap((step) =>
+    isRecord(step.call) && typeof step.call.id === "string" && step.call.id.trim() ? [step.call.id.trim()] : []
+  ));
   for (const ref of refs) {
     if (ref === source.sourceId) continue;
-    if (!ref.startsWith(prefix)) throw new Error(`direct-skill evidence ref is outside source: ${ref}`);
-    const index = Number(ref.slice(prefix.length));
-    if (!Number.isInteger(index) || index < 0 || index >= source.toolCalls.length) {
-      throw new Error(`direct-skill tool evidence ref is invalid: ${ref}`);
-    }
+    if (toolCallIds.has(ref)) continue;
+    if (!indexedRefs.has(ref)) throw new Error(`direct-skill evidence ref is outside source: ${ref}`);
   }
 }
 

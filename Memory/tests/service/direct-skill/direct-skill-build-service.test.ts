@@ -118,6 +118,55 @@ describe("DirectSkillBuildService", () => {
     expect(filterFailureUnsupportedCandidates(candidates.slice(0, 2))).toEqual([]);
   });
 
+  it("prepares a short trajectory and stores its segmentation without an L1 Trace", async () => {
+    const episode = buildEpisode("episode-raw-only");
+    const rawTurn = {
+      id: "raw-only",
+      sessionId: episode.sessionId,
+      episodeId: episode.id,
+      turnId: "turn-1",
+      userId: episode.userId,
+      userText: "update the workbook",
+      assistantText: "done",
+      toolCalls: [],
+      toolResults: [],
+      sourceMemoryIds: [],
+      usage: {},
+      messagePayload: {},
+      status: "succeeded",
+      createdAt: "2026-01-01T00:00:00.000Z"
+    };
+    let savedRawTurn = rawTurn;
+    const deps = {
+      repos: {
+        runtime: {
+          getEpisode: () => episode,
+          listRawTurnsByEpisode: () => [savedRawTurn],
+          getRawTurn: () => savedRawTurn,
+          updateRawTurn: (value: typeof rawTurn) => { savedRawTurn = value; return value; }
+        },
+        memories: { list: () => [] }
+      },
+      config: DEFAULT_MEMMY_CONFIG,
+      skillLlm: fakeLlm(),
+      buildMemory: () => { throw new Error("L1 must not be built"); },
+      upsertEvolutionMemory: () => { throw new Error("not called"); },
+      enqueueJob: () => { throw new Error("not called"); },
+      namespaceIdFromMemory: () => "namespace",
+      embedAfterCapture: () => false
+    } as unknown as DirectSkillBuildServiceDeps;
+    const service = new DirectSkillBuildService(deps) as unknown as {
+      prepareEpisodeSources(episodeId: string, rTask: number, at: string): Promise<Array<{ rawTurn: { id: string }; spans: unknown[] }>>;
+    };
+
+    const sources = await service.prepareEpisodeSources(episode.id, 1, "2026-01-01T00:00:00.000Z");
+
+    expect(sources).toEqual([{ rawTurn: expect.objectContaining({ id: rawTurn.id }), spans: [] }]);
+    expect(savedRawTurn.messagePayload).toMatchObject({
+      direct_skill_span_segmentation: { mode: "single_goal", spans: [] }
+    });
+  });
+
   it("prepares every Cluster before persisting any frozen Package", async () => {
     const episodes = new Map([
       ["episode-a", buildEpisode("episode-a")],

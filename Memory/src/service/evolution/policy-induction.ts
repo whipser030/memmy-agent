@@ -819,7 +819,8 @@ export class PolicyInductionEngine {
   }
 
   isTraceEligibleForL2(trace: TraceMeta): boolean {
-    return trace.memory.properties.internal_info.policy_eligible !== false &&
+    return this.deps.config.algorithm.l2Induction.enabled &&
+      trace.memory.properties.internal_info.policy_eligible !== false &&
       trace.memory.properties.internal_info.evidence_status !== "provisional" &&
       trace.memory.properties.internal_info.evidence_status !== "disputed" &&
       trace.value >= this.deps.config.algorithm.l2Induction.minTraceValue &&

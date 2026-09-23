@@ -1758,7 +1758,9 @@ export class SessionTurnService {
 
       const userMemoryCapture = this.captureUserMemory(rawTurn, request, at);
       const requestTags = this.deps.normalizeRequestTags(request.tags);
-      const capturedSteps = this.captureEpisodeIncrementalSteps(episode, rawTurn, at, Boolean(sourceTurn))
+      const capturedSteps = (this.deps.config.algorithm.capture.storeL1
+        ? this.captureEpisodeIncrementalSteps(episode, rawTurn, at, Boolean(sourceTurn))
+        : [])
         .map((step) => {
           const stepRawTurnId = step.rawTurnId ?? rawTurn.id;
           return stepRawTurnId === rawTurn.id && requestTags.length > 0

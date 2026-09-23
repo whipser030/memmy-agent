@@ -18,6 +18,26 @@ function configFor(skill: string): string {
   return file;
 }
 
+function evolutionConfigFor(): string {
+  const root = mkdtempSync(join(tmpdir(), "direct-skill-evolution-config-"));
+  roots.push(root);
+  const file = join(root, "config.yaml");
+  writeFileSync(file, [
+    "memmyMemory:",
+    "  algorithm:",
+    "    capture:",
+    "      storeL1: false",
+    "    l2Induction:",
+    "      enabled: false",
+    "    l3Abstraction:",
+    "      enabled: false",
+    "    skill:",
+    "      directMode: package_v1",
+    ""
+  ].join("\n"));
+  return file;
+}
+
 describe("Direct Skill mode config", () => {
   it("uses explicit directMode when present", () => {
     expect(loadMemmyConfig(configFor("      directMode: package_v1")).config.algorithm.skill.directMode)
@@ -29,5 +49,13 @@ describe("Direct Skill mode config", () => {
       .toBe("legacy");
     expect(loadMemmyConfig(configFor("      directFromTrace: false")).config.algorithm.skill.directMode)
       .toBe("off");
+  });
+
+  it("can disable L2 and L3 evolution without disabling Direct Package mode", () => {
+    const config = loadMemmyConfig(evolutionConfigFor()).config;
+    expect(config.algorithm.capture.storeL1).toBe(false);
+    expect(config.algorithm.l2Induction.enabled).toBe(false);
+    expect(config.algorithm.l3Abstraction.enabled).toBe(false);
+    expect(config.algorithm.skill.directMode).toBe("package_v1");
   });
 });

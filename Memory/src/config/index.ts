@@ -121,6 +121,7 @@ export interface AlgorithmConfig {
     maxTextChars: number;
     maxToolOutputChars: number;
     synthReflection: boolean;
+    storeL1: boolean;
     embedAfterCapture: boolean;
     alphaScoring: boolean;
     batchMode: CaptureBatchMode;
@@ -184,6 +185,7 @@ export interface AlgorithmConfig {
     implicitConfidenceCap: number;
   };
   l2Induction: {
+    enabled: boolean;
     useLlm: boolean;
     minEpisodesForInduction: number;
     minEpisodesForActivation: number;
@@ -197,6 +199,7 @@ export interface AlgorithmConfig {
     gainEmaAlpha: number;
   };
   l3Abstraction: {
+    enabled: boolean;
     useLlm: boolean;
     minPolicies: number;
     minPolicyGain: number;
@@ -371,6 +374,7 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
       maxTextChars: 4_000,
       maxToolOutputChars: 2_000,
       synthReflection: true,
+      storeL1: true,
       embedAfterCapture: true,
       alphaScoring: true,
       batchMode: "windowed",
@@ -434,6 +438,7 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
       implicitConfidenceCap: 0.65
     },
     l2Induction: {
+      enabled: true,
       useLlm: true,
       minEpisodesForInduction: 1,
       minEpisodesForActivation: 3,
@@ -447,6 +452,7 @@ export const DEFAULT_MEMMY_CONFIG: MemmyConfig = {
       gainEmaAlpha: 0.4
     },
     l3Abstraction: {
+      enabled: true,
       useLlm: true,
       minPolicies: 1,
       minPolicyGain: 0.02,
@@ -1111,6 +1117,7 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
       maxTextChars: numberValue(capture.maxTextChars, DEFAULT_MEMMY_CONFIG.algorithm.capture.maxTextChars),
       maxToolOutputChars: numberValue(capture.maxToolOutputChars, DEFAULT_MEMMY_CONFIG.algorithm.capture.maxToolOutputChars),
       synthReflection: booleanValue(capture.synthReflection, DEFAULT_MEMMY_CONFIG.algorithm.capture.synthReflection),
+      storeL1: booleanValue(capture.storeL1, DEFAULT_MEMMY_CONFIG.algorithm.capture.storeL1),
       embedAfterCapture: booleanValue(capture.embedAfterCapture, DEFAULT_MEMMY_CONFIG.algorithm.capture.embedAfterCapture),
       alphaScoring: booleanValue(capture.alphaScoring, DEFAULT_MEMMY_CONFIG.algorithm.capture.alphaScoring),
       batchMode: captureBatchMode(capture.batchMode, DEFAULT_MEMMY_CONFIG.algorithm.capture.batchMode),
@@ -1204,6 +1211,7 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
       )
     },
     l2Induction: {
+      enabled: booleanValue(l2.enabled, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.enabled),
       useLlm: booleanValue(l2.useLlm, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.useLlm),
       minEpisodesForInduction: numberValue(l2.minEpisodesForInduction, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.minEpisodesForInduction),
       minEpisodesForActivation: numberValue(l2.minEpisodesForActivation, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.minEpisodesForActivation),
@@ -1217,6 +1225,7 @@ function normalizeAlgorithm(input: Record<string, unknown>): AlgorithmConfig {
       gainEmaAlpha: numberValue(l2.gainEmaAlpha, DEFAULT_MEMMY_CONFIG.algorithm.l2Induction.gainEmaAlpha)
     },
     l3Abstraction: {
+      enabled: booleanValue(l3.enabled, DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction.enabled),
       useLlm: booleanValue(l3.useLlm, DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction.useLlm),
       minPolicies: numberValue(l3.minPolicies, DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction.minPolicies),
       minPolicyGain: numberValue(l3.minPolicyGain, DEFAULT_MEMMY_CONFIG.algorithm.l3Abstraction.minPolicyGain),

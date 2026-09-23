@@ -59,6 +59,39 @@ describe("PackageBuilder", () => {
       "2. Reopen the workbook and inspect its formulas."
     ].join("\n"));
   });
+
+  it("keeps modules unmerged when the organizer emits singleton groups", async () => {
+    const llm = fakeLlm(async (messages, options) => {
+      const payload = JSON.parse(messages[1]!.content) as Record<string, unknown>;
+      if (options.operation === "direct_skill.strength.review") {
+        const candidates = payload.candidates as Array<{ candidate: { moduleId: string } }>;
+        return { votes: candidates.map(({ candidate }) => ({
+          moduleId: candidate.moduleId,
+          constraintMode: "advisory",
+          guideSpecificity: "actionable",
+          authority: "task_evidence",
+          observability: "trace_observable",
+          strength: "L2",
+          reason: "actionable advice"
+        })) };
+      }
+      return {
+        title: "Workbook repair",
+        summary: "Repair and verify spreadsheet writes.",
+        mergeGroups: [{ groupId: "noop", candidateModuleIds: ["m1"] }],
+        alternativeGroups: [{ groupKey: "noop_choice", memberRefs: ["m2"] }]
+      };
+    });
+    const result = await new PackageBuilder(llm).build({
+      packageId: "package-singletons",
+      clusterId: "cluster-singletons",
+      candidates: [candidate("m1", "verify_save"), candidate("m2", "repair_save")],
+      sourceEpisodeIds: ["e1"],
+      createdAt: "2026-01-01T00:00:00.000Z"
+    });
+    expect(result.modules.map((module) => module.moduleId)).toEqual(["m1", "m2"]);
+    expect(result.modules.every((module) => module.alternativeGroupKey === undefined)).toBe(true);
+  });
 });
 
 function candidate(

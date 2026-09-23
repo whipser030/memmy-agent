@@ -9,6 +9,7 @@ import { classifySkillOutcome, isEvalSplitTest } from "../../algorithm/trace-dir
 import type { MemmyConfig } from "../../config/index.js";
 import type { LlmClient } from "../../model/types.js";
 import {
+  type EpisodeRecord,
   kindFromMemory,
   type EvolutionJobRecord,
   type RawTurnRecord,
@@ -20,7 +21,10 @@ import { isRecord } from "../../utils/json.js";
 import { newId, stableStringify } from "../../utils/id.js";
 import { nowIso } from "../../utils/time.js";
 import type { EnqueueJobInput } from "../worker/job-handlers.js";
-import { BigTurnSpanPipeline, SPAN_BIG_TURN_MIN_TOOL_CALLS } from "../evolution/big-turn-span-pipeline.js";
+import {
+  BigTurnSpanPipeline,
+  type DirectSkillTrajectorySpan
+} from "../evolution/big-turn-span-pipeline.js";
 import { SkillClusterPipeline } from "../evolution/skill-cluster-pipeline.js";
 
 export interface DirectSkillBuildRequest {
@@ -50,8 +54,7 @@ export interface DirectSkillBuildServiceDeps {
 
 interface TurnBuildSource {
   rawTurn: RawTurnRecord;
-  sourceTrace: MemoryRow;
-  spanIds: string[];
+  spans: DirectSkillTrajectorySpan[];
 }
 
 interface PreparedPackage {
@@ -187,14 +190,7 @@ export class DirectSkillBuildService {
     if (rawTurns.length === 0) throw new Error(`direct-skill Episode has no Raw Turns: ${episodeId}`);
     const sources: TurnBuildSource[] = [];
     for (const rawTurn of rawTurns) {
-      const sourceTrace = this.sourceTraceForRawTurn(episodeId, rawTurn.id);
-      if (!sourceTrace) throw new Error(`direct-skill Trace not found for Raw Turn: ${rawTurn.id}`);
-      if (rawTurn.toolCalls.length < SPAN_BIG_TURN_MIN_TOOL_CALLS) {
-        sources.push({ rawTurn, sourceTrace, spanIds: [] });
-        continue;
-      }
-      const segmentation = await this.spanPipeline.segmentForDirectSkill({
-        sourceTraceId: sourceTrace.id,
+      const segmentation = await this.spanPipeline.segmentTrajectoryForDirectSkill({
         rawTurnId: rawTurn.id,
         episodeId,
         rTask,
@@ -202,8 +198,7 @@ export class DirectSkillBuildService {
       });
       sources.push({
         rawTurn,
-        sourceTrace,
-        spanIds: segmentation.mode === "multi_goal" ? segmentation.spanIds : []
+        spans: segmentation.spans
       });
     }
     return sources;
@@ -232,16 +227,14 @@ export class DirectSkillBuildService {
       });
       const normalizedOutcome = outcome === "unknown" ? "mixed" : outcome;
       for (const source of sourceByEpisode.get(episodeId) ?? []) {
-        if (source.spanIds.length === 0) {
-          const result = await this.extractor.extractFromTurn(turnExtractionSource(source.rawTurn, normalizedOutcome));
-          if (result.decision === "accept") candidates.push(result.candidateModule);
+        if (source.spans.length === 0) {
+          const result = await this.extractor.extractFromTurn(turnExtractionSource(source.rawTurn, episode, normalizedOutcome));
+          if (result.decision === "accept") candidates.push(...result.modules.map((item) => item.candidateModule));
           continue;
         }
-        for (const spanId of source.spanIds) {
-          const span = this.deps.repos.memories.get(spanId);
-          if (!span) throw new Error(`direct-skill Span not found: ${spanId}`);
-          const result = await this.extractor.extractFromSpan(spanExtractionSource(span, source.rawTurn, normalizedOutcome));
-          if (result.decision === "accept") candidates.push(result.candidateModule);
+        for (const span of source.spans) {
+          const result = await this.extractor.extractFromSpan(spanExtractionSource(span, source.rawTurn, episode, normalizedOutcome));
+          if (result.decision === "accept") candidates.push(...result.modules.map((item) => item.candidateModule));
         }
       }
     }
@@ -314,13 +307,6 @@ export class DirectSkillBuildService {
     return upserted.memory;
   }
 
-  private sourceTraceForRawTurn(episodeId: string, rawTurnId: string): MemoryRow | undefined {
-    const episode = this.deps.repos.runtime.getEpisode(episodeId);
-    return episode?.l1MemoryIds
-      .map((id) => this.deps.repos.memories.get(id))
-      .find((memory): memory is MemoryRow => Boolean(memory && rawTurnIdFromMemory(memory) === rawTurnId));
-  }
-
   private existingPackageForCluster(clusterId: string): MemoryRow | undefined {
     return this.deps.repos.memories
       .list({ memoryLayer: "Skill", status: ["activated", "resolving"] }, 10_000)
@@ -378,6 +364,7 @@ export function validateManifest(episodeIds: string[]): string[] {
 
 function turnExtractionSource(
   rawTurn: RawTurnRecord,
+  episode: EpisodeRecord,
   outcome: DirectSkillExtractionSource["outcome"]
 ): DirectSkillExtractionSource {
   return {
@@ -389,32 +376,45 @@ function turnExtractionSource(
     assistantFinalAnswer: rawTurn.assistantText ?? "",
     subgoal: rawTurn.userText ?? "coherent task turn",
     summary: rawTurn.reasoningSummary ?? rawTurn.assistantText ?? "",
-    toolCalls: rawTurn.toolCalls
+    toolSteps: rawTurn.toolCalls.map((call, index) => ({
+      evidenceRef: `${rawTurn.id}:tool:${index}`,
+      call,
+      result: rawTurn.toolResults[index] ?? null
+    })),
+    evaluation: {
+      rTask: episode.rTask!,
+      detail: episode.rewardDetail
+    }
   };
 }
 
 function spanExtractionSource(
-  span: MemoryRow,
+  span: DirectSkillTrajectorySpan,
   rawTurn: RawTurnRecord,
+  episode: EpisodeRecord,
   outcome: DirectSkillExtractionSource["outcome"]
 ): DirectSkillExtractionSource {
-  const metadata = span.properties.internal_info.span;
-  if (!isRecord(metadata)) throw new Error(`direct-skill Span metadata is invalid: ${span.id}`);
-  const start = integer(metadata.tool_call_start);
-  const end = integer(metadata.tool_call_end);
-  if (start === undefined || end === undefined || start < 0 || end < start || end >= rawTurn.toolCalls.length) {
-    throw new Error(`direct-skill Span tool range is invalid: ${span.id}`);
+  if (span.start < 0 || span.end < span.start || span.end >= rawTurn.toolCalls.length) {
+    throw new Error(`direct-skill Span tool range is invalid: ${span.spanId}`);
   }
   return {
     sourceType: "span",
-    sourceId: span.id,
+    sourceId: span.spanId,
     episodeId: rawTurn.episodeId,
     outcome,
     userRequest: rawTurn.userText ?? "",
     assistantFinalAnswer: rawTurn.assistantText ?? "",
-    subgoal: text(metadata.span_goal) ?? span.memoryKey ?? "subgoal",
-    summary: text(metadata.summary) ?? span.memoryValue,
-    toolCalls: rawTurn.toolCalls.slice(start, end + 1)
+    subgoal: span.spanGoal,
+    summary: span.summary,
+    toolSteps: rawTurn.toolCalls.slice(span.start, span.end + 1).map((call, index) => ({
+      evidenceRef: `${span.spanId}:tool:${index}`,
+      call,
+      result: rawTurn.toolResults[span.start + index] ?? null
+    })),
+    evaluation: {
+      rTask: episode.rTask!,
+      detail: episode.rewardDetail
+    }
   };
 }
 
@@ -425,14 +425,6 @@ export function filterFailureUnsupportedCandidates(
     candidate.material.outcome === "failure" &&
     (candidate.type === "tactic" || candidate.type === "fast_path")
   ));
-}
-
-function rawTurnIdFromMemory(memory: MemoryRow): string | undefined {
-  const internal = memory.properties.internal_info;
-  const direct = internal.source_raw_turn_id ?? internal.raw_turn_id;
-  if (typeof direct === "string" && direct) return direct;
-  const trace = internal.trace;
-  return isRecord(trace) && typeof trace.raw_turn_id === "string" ? trace.raw_turn_id : undefined;
 }
 
 function renderPackageSummary(packageValue: DirectSkillPackage): string {
@@ -446,14 +438,6 @@ function renderPackageSummary(packageValue: DirectSkillPackage): string {
     "Modules:",
     ...packageValue.modules.map((module) => `- [${module.strength}] ${module.semanticKey}: ${module.instruction}`)
   ].filter(Boolean).join("\n");
-}
-
-function integer(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isInteger(value) ? value : undefined;
-}
-
-function text(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function unique(values: string[]): string[] {

@@ -2995,6 +2995,7 @@ function memoryConfigLogFields(config: MemmyConfig): Record<string, unknown> {
     embeddingMode: config.embedding.mode,
     memoryAddEnabled: config.algorithm.enableMemoryAdd,
     memorySearchEnabled: config.algorithm.enableMemorySearch,
+    l1StorageEnabled: config.algorithm.capture.storeL1,
     summaryModel: {
       provider: config.summary.provider,
       vendor: config.summary.vendor,
@@ -3020,9 +3021,11 @@ function memoryConfigLogFields(config: MemmyConfig): Record<string, unknown> {
       maxRetries: config.embedding.maxRetries
     },
     evolutionGates: {
+      l2Enabled: config.algorithm.l2Induction.enabled,
       l2UseLlm: config.algorithm.l2Induction.useLlm,
       l2MinEpisodes: config.algorithm.l2Induction.minEpisodesForInduction,
       l2MinGain: config.algorithm.l2Induction.minGain,
+      l3Enabled: config.algorithm.l3Abstraction.enabled,
       l3UseLlm: config.algorithm.l3Abstraction.useLlm,
       l3MinPolicies: config.algorithm.l3Abstraction.minPolicies,
       l3MinPolicyGain: config.algorithm.l3Abstraction.minPolicyGain,

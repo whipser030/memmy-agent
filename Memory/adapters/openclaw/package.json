@@ -3,5 +3,18 @@
   "version": "2.1.0",
   "type": "module",
   "main": "index.js",
-  "private": true
+  "private": true,
+  "peerDependencies": {
+    "openclaw": ">=2026.9.5"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  }
 }

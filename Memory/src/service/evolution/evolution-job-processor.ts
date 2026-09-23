@@ -180,19 +180,23 @@ export class EvolutionJobProcessor {
   }
 
   induceL2(job: EvolutionJobRecord): Promise<void> {
+    if (!this.deps.config.algorithm.l2Induction.enabled) return Promise.resolve();
     return this.policy.induceL2(job);
   }
 
   associateL2(job: EvolutionJobRecord): void {
+    if (!this.deps.config.algorithm.l2Induction.enabled) return;
     return this.policy.associateL2(job);
   }
 
   abstractL3(job: EvolutionJobRecord): Promise<void> {
+    if (!this.deps.config.algorithm.l3Abstraction.enabled) return Promise.resolve();
     void job;
     return Promise.resolve();
   }
 
   updateL3WorldModel(job: EvolutionJobRecord): Promise<void> {
+    if (!this.deps.config.algorithm.l3Abstraction.enabled) return Promise.resolve();
     return this.l3WorldModel.updateField(job);
   }
 
