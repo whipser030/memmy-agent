@@ -1,5 +1,6 @@
 const ENDPOINT = (process.env.MEMMY_MEMORY_URL || "http://127.0.0.1:18960").replace(/\/$/, "");
 const DEBUG = process.env.MEMMY_ADAPTER_DEBUG === "1";
+const DIRECT_SKILL_REQUEST_TIMEOUT_MS = 60_000;
 const sessions = new Map();
 const turns = new Map();
 
@@ -142,6 +143,7 @@ async function selectDirectModules(state, event, ctx, messages) {
   if (!candidates.length) return null;
   const response = await request("/direct-skills/select-modules", {
     method: "POST", profileId: profile(ctx),
+    timeout: DIRECT_SKILL_REQUEST_TIMEOUT_MS,
     body: {
       packageId: state.skillPackage.packageId,
       candidateModuleIds: candidates.map((module) => module.moduleId),
@@ -295,6 +297,7 @@ function register(api) {
       rememberTurn(event, ctx, state);
       const routed = await request("/direct-skills/route-package", {
         method: "POST", profileId: profile(ctx),
+        timeout: DIRECT_SKILL_REQUEST_TIMEOUT_MS,
         body: { query, toolNames: [], workspace: ctx.workspaceDir || ctx.cwd },
       });
       state.skillPackage = normalizePackage(routed.package || routed.skillPackage);

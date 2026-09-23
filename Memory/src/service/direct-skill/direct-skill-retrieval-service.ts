@@ -83,51 +83,57 @@ export class DirectSkillRetrievalService {
       .map((memory) => packageFromMemory(memory))
       .filter((value): value is DirectSkillPackage => value !== null)
       .slice(0, ROUTE_CANDIDATE_LIMIT);
-    if (candidates.length === 0 || !this.deps.skillLlm.isConfigured()) {
+    if (candidates.length === 0) {
       return { package: null };
     }
+    if (!this.deps.skillLlm.isConfigured()) {
+      return { package: candidates[0]! };
+    }
 
-    const response = await this.deps.skillLlm.completeJson<{ packageId?: unknown }>([
-      {
-        role: "system",
-        content: [
-          "Select at most one Direct Skill Package for the current task.",
-          "Return JSON only: {\"packageId\": string|null}.",
-          "Choose only a listed packageId. Return null when none is clearly relevant.",
-          "A package may be relevant as execution or pre-submit guidance even when the user does not explicitly ask for that verification step.",
-          "Judge applicability from the module instruction, scope, and trigger events; do not require title words to appear in the task."
-        ].join("\n")
-      },
-      {
-        role: "user",
-        content: JSON.stringify({
-          task: query,
-          toolNames: request.toolNames,
-          workspace: request.workspace,
-          candidates: candidates.map((candidate) => ({
-            packageId: candidate.packageId,
-            title: candidate.title,
-            summary: candidate.summary,
-            modules: candidate.modules.map((module) => ({
-              type: module.type,
-              instruction: module.instruction,
-              scope: module.scope,
-              triggerEvents: module.triggerEvents
+    try {
+      const response = await this.deps.skillLlm.completeJson<{ packageId?: unknown }>([
+        {
+          role: "system",
+          content: [
+            "Select exactly one Direct Skill Package for the current task.",
+            "Return JSON only: {\"packageId\": string}.",
+            "You must choose one listed packageId; never return null or abstain.",
+            "A package may be relevant as execution or pre-submit guidance even when the user does not explicitly ask for that verification step.",
+            "Judge applicability from the module instruction, scope, and trigger events; do not require title words to appear in the task."
+          ].join("\n")
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            task: query,
+            toolNames: request.toolNames,
+            workspace: request.workspace,
+            candidates: candidates.map((candidate) => ({
+              packageId: candidate.packageId,
+              title: candidate.title,
+              summary: candidate.summary,
+              modules: candidate.modules.map((module) => ({
+                type: module.type,
+                instruction: module.instruction,
+                scope: module.scope,
+                triggerEvents: module.triggerEvents
+              }))
             }))
-          }))
-        })
-      }
-    ], {
-      operation: "direct_skill.route_package.v1",
-      thinkingMode: "disabled",
-      temperature: 0,
-      timeoutMs: MODEL_TIMEOUT_MS,
-      maxRetries: 1,
-      maxTokens: 256,
-      jsonMode: true
-    });
-    const packageId = typeof response.packageId === "string" ? response.packageId.trim() : "";
-    return { package: candidates.find((candidate) => candidate.packageId === packageId) ?? null };
+          })
+        }
+      ], {
+        operation: "direct_skill.route_package.v1",
+        thinkingMode: "disabled",
+        temperature: 0,
+        timeoutMs: MODEL_TIMEOUT_MS,
+        maxRetries: 1,
+        maxTokens: 256,
+        jsonMode: true
+      });
+      return { package: selectRequiredPackage(candidates, response.packageId) };
+    } catch {
+      return { package: candidates[0]! };
+    }
   }
 
   async selectModules(request: SelectDirectSkillModulesRequest): Promise<SelectDirectSkillModulesResponse> {
@@ -197,6 +203,15 @@ export class DirectSkillRetrievalService {
       return { packageId: request.packageId, selectedModuleIds: [], reason: "invalid_model_selection" };
     }
   }
+}
+
+export function selectRequiredPackage(
+  candidates: readonly DirectSkillPackage[],
+  packageId: unknown
+): DirectSkillPackage | null {
+  if (candidates.length === 0) return null;
+  const selectedId = typeof packageId === "string" ? packageId.trim() : "";
+  return candidates.find((candidate) => candidate.packageId === selectedId) ?? candidates[0]!;
 }
 
 export function validateSelectedModules(

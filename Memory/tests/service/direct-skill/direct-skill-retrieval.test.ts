@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { DirectSkillModule, DirectSkillPackage } from "../../../src/algorithm/direct-skill/types.js";
 import {
   packageFromMemory,
+  selectRequiredPackage,
   validateSelectedModules
 } from "../../../src/service/direct-skill/direct-skill-retrieval-service.js";
 import { directSkillExcludedTags } from "../../../src/service/retrieval/retrieval-service.js";
@@ -22,6 +23,20 @@ function module(moduleId: string, alternativeGroupKey?: string): DirectSkillModu
     alternativeGroupKey,
     sourceModuleIds: [moduleId],
     strengthDecisions: []
+  };
+}
+
+function skillPackage(packageId: string): DirectSkillPackage {
+  return {
+    schemaVersion: 1,
+    packageId,
+    clusterId: `cluster_${packageId}`,
+    title: packageId,
+    summary: packageId,
+    status: "frozen",
+    modules: [module(`module_${packageId}`)],
+    sourceEpisodeIds: ["episode_1"],
+    createdAt: "2026-01-01T00:00:00.000Z"
   };
 }
 
@@ -74,5 +89,14 @@ describe("Direct Skill retrieval boundaries", () => {
       .toEqual(["m1", "m3"]);
     expect(() => validateSelectedModules(["unknown"], ["m1"], modules)).toThrow(/outside/);
     expect(() => validateSelectedModules(["m1", "m2"], ["m1", "m2"], modules)).toThrow(/mutually exclusive/);
+  });
+
+  it("always selects a package when candidates exist", () => {
+    const candidates = [skillPackage("dsp_first"), skillPackage("dsp_second")];
+
+    expect(selectRequiredPackage(candidates, "dsp_second")?.packageId).toBe("dsp_second");
+    expect(selectRequiredPackage(candidates, null)?.packageId).toBe("dsp_first");
+    expect(selectRequiredPackage(candidates, "unknown")?.packageId).toBe("dsp_first");
+    expect(selectRequiredPackage([], "dsp_first")).toBeNull();
   });
 });
