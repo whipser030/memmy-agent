@@ -167,7 +167,7 @@ describe("DirectSkillBuildService", () => {
     });
   });
 
-  it("prepares every Cluster before persisting any frozen Package", async () => {
+  it("persists each completed Package even when a later Cluster fails", async () => {
     const episodes = new Map([
       ["episode-a", buildEpisode("episode-a")],
       ["episode-b", buildEpisode("episode-b")]
@@ -187,7 +187,9 @@ describe("DirectSkillBuildService", () => {
       if (clusterId === "cluster-b") throw new Error("consolidation failed");
       return { cluster: { id: clusterId }, packageValue: { packageId: "dsp-a" } };
     };
-    const persist = vi.fn();
+    const persist = vi.fn((_cluster: { id: string }, packageValue: { packageId: string }) => ({
+      id: packageValue.packageId
+    }));
     internals.persistPackage = persist;
 
     const result = await service.build({
@@ -195,9 +197,50 @@ describe("DirectSkillBuildService", () => {
       builder: "package_v1"
     });
 
-    expect(result.builtMemoryIds).toEqual([]);
+    expect(result.builtMemoryIds).toEqual(["dsp-a"]);
     expect(result.failures).toEqual([{ clusterId: "cluster-b", reason: "consolidation failed" }]);
-    expect(persist).not.toHaveBeenCalled();
+    expect(persist).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds parallel Package construction by clusterConcurrency", async () => {
+    const episodes = new Map(Array.from({ length: 6 }, (_, index) => {
+      const id = `episode-${index}`;
+      return [id, buildEpisode(id)];
+    }));
+    const deps = buildDeps(episodes);
+    const service = new DirectSkillBuildService(deps);
+    const internals = service as unknown as {
+      prepareEpisodeSources(episodeId: string): Promise<unknown[]>;
+      clusterPipeline: { assignEpisodeForDirectBuild(episodeId: string): Promise<string> };
+      buildPackageValue(clusterId: string): Promise<unknown>;
+      persistPackage(cluster: { id: string }, packageValue: { packageId: string }): { id: string };
+    };
+    internals.prepareEpisodeSources = async () => [];
+    internals.clusterPipeline.assignEpisodeForDirectBuild = async (episodeId) =>
+      episodeId.replace("episode", "cluster");
+    let active = 0;
+    let maxActive = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    internals.buildPackageValue = async (clusterId) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      if (active === 5) release();
+      await gate;
+      active -= 1;
+      return { cluster: { id: clusterId }, packageValue: { packageId: `dsp-${clusterId}` } };
+    };
+    internals.persistPackage = (_cluster, packageValue) => ({ id: packageValue.packageId });
+
+    const result = await service.build({
+      episodeIds: [...episodes.keys()],
+      builder: "package_v1",
+      clusterConcurrency: 5
+    });
+
+    expect(maxActive).toBe(5);
+    expect(result.builtMemoryIds).toHaveLength(6);
+    expect(result.failures).toEqual([]);
   });
 
   it("reuses an existing Cluster whose complete membership belongs to the retry manifest", async () => {
@@ -239,7 +282,7 @@ describe("DirectSkillBuildService", () => {
       builder: "package_v1"
     });
 
-    expect(assign).toHaveBeenCalledTimes(2);
+    expect(assign).not.toHaveBeenCalled();
     expect(result).toMatchObject({
       clusterIds: [existingCluster.id],
       builtMemoryIds: ["dsp-existing"],

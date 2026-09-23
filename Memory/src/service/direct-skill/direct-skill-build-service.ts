@@ -30,6 +30,8 @@ import { SkillClusterPipeline } from "../evolution/skill-cluster-pipeline.js";
 export interface DirectSkillBuildRequest {
   episodeIds: string[];
   builder: "legacy" | "package_v1";
+  clusterConcurrency?: number;
+  resumeExistingPackages?: boolean;
 }
 
 export interface DirectSkillBuildResult {
@@ -103,7 +105,13 @@ export class DirectSkillBuildService {
       if (typeof episode.rTask !== "number") throw new Error(`direct-skill Episode is not scored: ${episodeId}`);
       return episode;
     });
-    if (request.builder === "package_v1") this.assertNoFrozenPackageForEpisodes(episodeIds);
+    const clusterConcurrency = validateClusterConcurrency(request.clusterConcurrency);
+    const existingPackages = request.builder === "package_v1"
+      ? this.existingPackagesForEpisodes(episodeIds)
+      : [];
+    if (existingPackages.length > 0 && !request.resumeExistingPackages) {
+      throw new Error(`direct-skill manifest overlaps frozen Package: ${existingPackages[0]!.id}`);
+    }
     const at = this.deps.nowIso?.() ?? nowIso();
     const failures: DirectSkillBuildResult["failures"] = [];
     const sourceByEpisode = new Map<string, TurnBuildSource[]>();
@@ -132,7 +140,12 @@ export class DirectSkillBuildService {
     const episodeIdsByCluster = new Map<string, string[]>();
     for (const episode of episodes) {
       try {
-        const clusterId = await this.clusterPipeline.assignEpisodeForDirectBuild(episode.id, at, clusterIds);
+        const assignedCluster = request.builder === "package_v1"
+          ? this.deps.repos.runtime.getSkillClusterForEpisode(episode.id)
+          : undefined;
+        const clusterId = assignedCluster && clusterIds.has(assignedCluster.id)
+          ? assignedCluster.id
+          : await this.clusterPipeline.assignEpisodeForDirectBuild(episode.id, at, clusterIds);
         clusterIds.add(clusterId);
         episodeIdsByCluster.set(clusterId, [...(episodeIdsByCluster.get(clusterId) ?? []), episode.id]);
       } catch (error) {
@@ -148,33 +161,42 @@ export class DirectSkillBuildService {
       };
     }
 
+    const sortedClusterIds = [...clusterIds].sort();
     const builtMemoryIds: string[] = [];
-    const preparedPackages: PreparedPackage[] = [];
-    for (const clusterId of [...clusterIds].sort()) {
-      try {
-        if (request.builder === "legacy") {
+    if (request.builder === "legacy") {
+      for (const clusterId of sortedClusterIds) {
+        try {
           const memoryId = await this.clusterPipeline.buildLegacyClusterForDirectBuild(clusterId, at);
           if (memoryId) builtMemoryIds.push(memoryId);
-          continue;
+        } catch (error) {
+          failures.push({ clusterId, reason: errorMessage(error) });
         }
-        preparedPackages.push(await this.buildPackageValue(
-          clusterId,
-          episodeIdsByCluster.get(clusterId) ?? [],
-          sourceByEpisode,
-          at
-        ));
-      } catch (error) {
-        failures.push({ clusterId, reason: errorMessage(error) });
       }
-    }
-
-    if (request.builder === "package_v1" && failures.length === 0) {
-      const persisted = this.deps.repos.transaction(() =>
-        preparedPackages.map(({ cluster, packageValue }) =>
-          this.persistPackage(cluster, packageValue, at)
-        )
-      );
-      builtMemoryIds.push(...persisted.map((memory) => memory.id));
+    } else {
+      this.assertResumePackagesCompatible(existingPackages, episodeIdsByCluster);
+      const existingByCluster = new Map(existingPackages.map((memory) => [packageClusterId(memory), memory]));
+      const results = await mapWithConcurrency(sortedClusterIds, clusterConcurrency, async (clusterId) => {
+        try {
+          const existing = existingByCluster.get(clusterId);
+          if (existing) return { clusterId, memoryId: existing.id };
+          const prepared = await this.buildPackageValue(
+            clusterId,
+            episodeIdsByCluster.get(clusterId) ?? [],
+            sourceByEpisode,
+            at
+          );
+          const persisted = this.deps.repos.transaction(() =>
+            this.persistPackage(prepared.cluster, prepared.packageValue, at)
+          );
+          return { clusterId, memoryId: persisted.id };
+        } catch (error) {
+          return { clusterId, reason: errorMessage(error) };
+        }
+      });
+      for (const result of results) {
+        if (typeof result.memoryId === "string") builtMemoryIds.push(result.memoryId);
+        else failures.push({ clusterId: result.clusterId, reason: result.reason });
+      }
     }
 
     return {
@@ -316,11 +338,11 @@ export class DirectSkillBuildService {
         memory.properties.internal_info.direct_skill_package.clusterId === clusterId);
   }
 
-  private assertNoFrozenPackageForEpisodes(episodeIds: string[]): void {
+  private existingPackagesForEpisodes(episodeIds: string[]): MemoryRow[] {
     const requested = new Set(episodeIds);
-    const existing = this.deps.repos.memories
+    return this.deps.repos.memories
       .list({ memoryLayer: "Skill", status: ["activated", "resolving"] }, 10_000)
-      .find((memory) => {
+      .filter((memory) => {
         const value = memory.properties.internal_info.direct_skill_package;
         return memory.tags.includes("direct-skill-package") &&
           memory.properties.internal_info.runtime_managed === "direct_skill_v1" &&
@@ -328,8 +350,22 @@ export class DirectSkillBuildService {
           Array.isArray(value.sourceEpisodeIds) &&
           value.sourceEpisodeIds.some((episodeId) => typeof episodeId === "string" && requested.has(episodeId));
       });
-    if (existing) {
-      throw new Error(`direct-skill manifest overlaps frozen Package: ${existing.id}`);
+  }
+
+  private assertResumePackagesCompatible(
+    existingPackages: MemoryRow[],
+    episodeIdsByCluster: Map<string, string[]>
+  ): void {
+    for (const memory of existingPackages) {
+      const clusterId = packageClusterId(memory);
+      const packageValue = memory.properties.internal_info.direct_skill_package;
+      const storedEpisodeIds = isRecord(packageValue) && Array.isArray(packageValue.sourceEpisodeIds)
+        ? packageValue.sourceEpisodeIds.filter((value): value is string => typeof value === "string")
+        : [];
+      const requestedEpisodeIds = episodeIdsByCluster.get(clusterId) ?? [];
+      if (!sameStringSet(storedEpisodeIds, requestedEpisodeIds)) {
+        throw new Error(`direct-skill resume does not match frozen Package: ${memory.id}`);
+      }
     }
   }
 
@@ -446,4 +482,43 @@ function unique(values: string[]): string[] {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : stableStringify(error);
+}
+
+function validateClusterConcurrency(value: number | undefined): number {
+  const normalized = value ?? 1;
+  if (!Number.isInteger(normalized) || normalized < 1 || normalized > 32) {
+    throw new Error("direct-skill clusterConcurrency must be an integer from 1 to 32");
+  }
+  return normalized;
+}
+
+function packageClusterId(memory: MemoryRow): string {
+  const packageValue = memory.properties.internal_info.direct_skill_package;
+  if (!isRecord(packageValue) || typeof packageValue.clusterId !== "string") {
+    throw new Error(`direct-skill Package has no Cluster ID: ${memory.id}`);
+  }
+  return packageValue.clusterId;
+}
+
+function sameStringSet(left: string[], right: string[]): boolean {
+  const leftSet = new Set(left);
+  const rightSet = new Set(right);
+  return leftSet.size === rightSet.size && [...leftSet].every((value) => rightSet.has(value));
+}
+
+async function mapWithConcurrency<T, R>(
+  values: T[],
+  concurrency: number,
+  run: (value: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (nextIndex < values.length) {
+      const index = nextIndex++;
+      results[index] = await run(values[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }

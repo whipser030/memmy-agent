@@ -22,8 +22,9 @@ Each accepted module must satisfy at least one memory-strength definition:
 - L2-worthy: explicit executable advice or warning.
 - L3-worthy: a trace-observable execution contract with trigger, action, completion rule, evidence, and recovery.
 - L4-worthy: an authoritative hard task constraint explicitly present in the trajectory, with violation and recovery/stop behavior.
-Do not assign a strength; a separate voter does that. Do not extract narration, incidental commands, sample-specific values, or duplicates.
-Keep instruction, completionRule, requiredEvidence, and recovery reusable: never copy current row numbers, totals, file paths, or record identifiers into those fields.
+Do not assign a strength; a separate voter does that. Do not extract narration, incidental commands, or duplicates.
+Concrete raw values from this trajectory, such as dates, amounts, totals, row numbers, cell values, file paths, or record identifiers, may appear in material.observation as source-grounded examples or evidence.
+Do not turn those observed values into guidance: candidateModule.instruction, completionRule, requiredEvidence, and recovery must describe reusable actions, relationships, and verification methods without copying current-instance data. A literal explicitly stated as an invariant task constraint is not raw observed data and may be preserved only with aligned authorityEvidence.
 For a coherent turn, prioritize the core solution that caused task success, then distinct verification, invariant, repair, avoidance, or fast-path knowledge. Multiple modules are allowed.
 Each toolSteps entry contains the call, its result, and its exact evidenceRef. Copy that evidenceRef verbatim; do not invent or renumber evidence references.
 Official evaluation confirms the overall task outcome only; do not claim it proves an action that is absent from the trace.

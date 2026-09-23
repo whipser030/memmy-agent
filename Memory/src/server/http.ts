@@ -541,7 +541,29 @@ async function routeRequest(
     if (request.builder !== "legacy" && request.builder !== "package_v1") {
       throw new MemoryServiceError("invalid_argument", "direct-skills.build.builder must be legacy or package_v1");
     }
-    return service.buildDirectSkills({ episodeIds, builder: request.builder });
+    if (request.clusterConcurrency !== undefined && (
+      typeof request.clusterConcurrency !== "number" ||
+      !Number.isInteger(request.clusterConcurrency) ||
+      request.clusterConcurrency < 1 ||
+      request.clusterConcurrency > 32
+    )) {
+      throw new MemoryServiceError(
+        "invalid_argument",
+        "direct-skills.build.clusterConcurrency must be an integer from 1 to 32"
+      );
+    }
+    if (request.resumeExistingPackages !== undefined && typeof request.resumeExistingPackages !== "boolean") {
+      throw new MemoryServiceError(
+        "invalid_argument",
+        "direct-skills.build.resumeExistingPackages must be a boolean"
+      );
+    }
+    return service.buildDirectSkills({
+      episodeIds,
+      builder: request.builder,
+      clusterConcurrency: request.clusterConcurrency,
+      resumeExistingPackages: request.resumeExistingPackages
+    });
   }
   if (method === "POST" && path === "/api/v1/admin/shutdown") {
     requireAdminWrite(principal);
