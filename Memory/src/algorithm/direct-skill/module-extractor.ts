@@ -1,4 +1,5 @@
 import type { LlmClient } from "../../model/types.js";
+import { createMemoryLogger } from "../../logging/logger.js";
 import { stableHash, stableStringify } from "../../utils/id.js";
 import { isRecord } from "../../utils/json.js";
 import {
@@ -12,6 +13,8 @@ import {
   type ModuleScope,
   type SpanModuleExtractionResult
 } from "./types.js";
+
+const moduleExtractorLogger = createMemoryLogger("direct-skill-module-extractor");
 
 const MODULE_EXTRACTION_PROMPT = `Extract all materially distinct, reusable, task-relevant modules from one trajectory span or one coherent turn.
 
@@ -58,6 +61,15 @@ Return JSON only:
   }]
 }`;
 
+const MODULE_REPAIR_PROMPT = `Repair structurally invalid candidate modules using only the supplied trajectory source.
+
+For each invalid module, preserve its semanticKey and intended guidance. Correct only the fields identified by validationErrors.
+For task_hard_constraint authority, either provide an authorityEvidence statement copied verbatim from the source with a valid evidenceRef, or correct the authority when the source does not support a hard constraint.
+Do not add unrelated modules, remove valid guidance, or invent evidence.
+
+Return JSON only:
+{ "modules": [{ "material": {...}, "candidateModule": {...} }] }`;
+
 const AUTHORITIES: AuthoritySource[] = [
   "ordinary_experience",
   "task_evidence",
@@ -73,6 +85,12 @@ const EVIDENCE_PATTERNS: EvidencePattern[] = [
   "explicit_statement",
   "mixed_or_uncertain"
 ];
+
+interface InvalidModuleDraft {
+  value: unknown;
+  semanticKey: string;
+  reason: string;
+}
 
 export class ModuleExtractor {
   constructor(private readonly llm: LlmClient) {}
@@ -108,24 +126,68 @@ export class ModuleExtractor {
       throw new Error("direct-skill extractor accepted without modules");
     }
     const semanticKeys = new Set<string>();
-    const modules = result.modules.map((value) => {
-      if (!isRecord(value) || !isRecord(value.candidateModule)) {
-        throw new Error("direct-skill extractor returned invalid module entry");
-      }
-      const semanticKey = requiredText(value.candidateModule.semanticKey, "candidateModule.semanticKey");
-      if (semanticKeys.has(semanticKey)) throw new Error(`direct-skill extractor duplicated semanticKey: ${semanticKey}`);
-      semanticKeys.add(semanticKey);
-      const material = parseMaterial(value.material, source, semanticKey);
-      const candidate = parseCandidate(value.candidateModule, source, material);
-      return {
-        material,
-        candidateModule: {
-          ...candidate,
-          moduleId: `dsm_${stableHash(`${source.episodeId}:${source.sourceId}:${candidate.semanticKey}`).slice(0, 20)}`,
-          material
+    const parsed = parseModuleDrafts(result.modules, source, semanticKeys);
+    const modules = [...parsed.modules];
+    let unresolved = parsed.invalid;
+    if (unresolved.length > 0) {
+      try {
+        const repaired = await this.llm.completeJson<Record<string, unknown>>([
+          { role: "system", content: MODULE_REPAIR_PROMPT },
+          {
+            role: "user",
+            content: stableStringify({
+              source,
+              invalidModules: unresolved.map((item) => ({
+                semanticKey: item.semanticKey,
+                validationError: item.reason,
+                module: item.value
+              }))
+            })
+          }
+        ], {
+          operation: "direct_skill.module.repair",
+          jsonMode: true,
+          temperature: 0.2,
+          maxTokens: 8192
+        });
+        if (!Array.isArray(repaired.modules)) {
+          throw new Error("direct-skill Module repair omitted modules");
         }
-      };
-    });
+        const expectedKeys = new Set(unresolved.map((item) => item.semanticKey));
+        const repairValues = repaired.modules.filter((value) =>
+          isRecord(value) && isRecord(value.candidateModule) &&
+          typeof value.candidateModule.semanticKey === "string" &&
+          expectedKeys.has(value.candidateModule.semanticKey)
+        );
+        const repairParsed = parseModuleDrafts(repairValues, source, semanticKeys);
+        modules.push(...repairParsed.modules);
+        const repairedKeys = new Set(repairParsed.modules.map((item) => item.candidateModule.semanticKey));
+        unresolved = [
+          ...repairParsed.invalid,
+          ...unresolved.filter((item) => !repairedKeys.has(item.semanticKey) &&
+            !repairParsed.invalid.some((failure) => failure.semanticKey === item.semanticKey))
+        ];
+      } catch (error) {
+        unresolved = unresolved.map((item) => ({
+          ...item,
+          reason: `${item.reason}; repair failed: ${errorMessage(error)}`
+        }));
+      }
+    }
+    if (unresolved.length > 0) {
+      moduleExtractorLogger.warn("repair.failed", {
+        operation: "direct_skill.module.repair",
+        episodeId: source.episodeId,
+        sourceType: source.sourceType,
+        sourceId: source.sourceId,
+        semanticKeys: unresolved.map((item) => item.semanticKey),
+        reasons: unresolved.map((item) => item.reason)
+      });
+      if (modules.length === 0) {
+        throw new Error(`direct-skill Module repair failed: ${unresolved.map((item) =>
+          `${item.semanticKey}: ${item.reason}`).join("; ")}`);
+      }
+    }
     return {
       decision: "accept",
       modules
@@ -133,18 +195,77 @@ export class ModuleExtractor {
   }
 }
 
-function parseMaterial(value: unknown, source: DirectSkillExtractionSource, semanticKey: string): ModuleMaterial {
+function parseModuleDrafts(
+  values: unknown[],
+  source: DirectSkillExtractionSource,
+  semanticKeys: Set<string>
+): {
+  modules: Array<Extract<SpanModuleExtractionResult, { decision: "accept" }>["modules"][number]>;
+  invalid: InvalidModuleDraft[];
+} {
+  const modules: Array<Extract<SpanModuleExtractionResult, { decision: "accept" }>["modules"][number]> = [];
+  const invalid: InvalidModuleDraft[] = [];
+  values.forEach((value, index) => {
+    const semanticKey = isRecord(value) && isRecord(value.candidateModule) &&
+      typeof value.candidateModule.semanticKey === "string" && value.candidateModule.semanticKey.trim()
+      ? value.candidateModule.semanticKey.trim()
+      : `module_index_${index}`;
+    try {
+      if (!isRecord(value) || !isRecord(value.candidateModule)) {
+        throw new Error("direct-skill extractor returned invalid module entry");
+      }
+      if (semanticKeys.has(semanticKey)) {
+        throw new Error(`direct-skill extractor duplicated semanticKey: ${semanticKey}`);
+      }
+      const material = parseMaterial(
+        value.material,
+        source,
+        semanticKey,
+        value.candidateModule.authority === "task_hard_constraint"
+      );
+      const candidate = parseCandidate(value.candidateModule, source, material);
+      semanticKeys.add(semanticKey);
+      modules.push({
+        material,
+        candidateModule: {
+          ...candidate,
+          moduleId: `dsm_${stableHash(`${source.episodeId}:${source.sourceId}:${candidate.semanticKey}`).slice(0, 20)}`,
+          material
+        }
+      });
+    } catch (error) {
+      invalid.push({ value, semanticKey, reason: errorMessage(error) });
+    }
+  });
+  return { modules, invalid };
+}
+
+function parseMaterial(
+  value: unknown,
+  source: DirectSkillExtractionSource,
+  semanticKey: string,
+  requiresAuthorityEvidence: boolean
+): ModuleMaterial {
   if (!isRecord(value)) throw new Error("direct-skill extractor returned invalid material");
   const evidenceRefs = parseEvidenceRefs(value.evidenceRefs, "material.evidenceRefs", source);
   let authorityEvidence: ModuleMaterial["authorityEvidence"];
   if (value.authorityEvidence !== undefined && value.authorityEvidence !== null) {
     try {
       authorityEvidence = parseAuthorityEvidence(value.authorityEvidence, source);
-    } catch {
-      // Non-hard modules do not consume authorityEvidence. If the candidate later
-      // claims task_hard_constraint, parseCandidate rejects the missing alignment.
+    } catch (error) {
+      if (requiresAuthorityEvidence) {
+        throw new Error(
+          `direct-skill hard constraint authorityEvidence is invalid, semanticKey=${semanticKey}, ` +
+          `reason=${errorMessage(error)}`
+        );
+      }
+      // Non-hard modules do not consume authorityEvidence.
       authorityEvidence = undefined;
     }
+  } else if (requiresAuthorityEvidence) {
+    throw new Error(
+      `direct-skill hard constraint omitted authorityEvidence, semanticKey=${semanticKey}`
+    );
   }
   return {
     materialId: `dsmat_${stableHash(`${source.episodeId}:${source.sourceId}:${semanticKey}`).slice(0, 20)}`,
@@ -266,6 +387,10 @@ function requiredText(value: unknown, field: string): string {
 
 function optionalText(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function unique<T>(values: T[]): T[] {

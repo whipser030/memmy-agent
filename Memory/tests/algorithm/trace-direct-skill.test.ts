@@ -8,6 +8,7 @@ import {
   decideEvolveBranch,
   extractArtifactTypes,
   extractEpisodeSkillFeatures,
+  extractTaskQuery,
   coerceDirectSkillProcedure,
   MAX_DIRECT_SKILL_ANTI_PATTERN,
   MAX_DIRECT_SKILL_PRECONDITIONS,
@@ -108,6 +109,37 @@ describe("trace-direct-skill algorithm", () => {
     expect(features.outcome).toBe("success");
   });
 
+  it("extracts the actual instruction from a benchmark task wrapper", () => {
+    expect(extractTaskQuery([{
+      userText: [
+        "You are the execution agent for one SpreadsheetBench task.",
+        "Input workbook: /tmp/input.xlsx",
+        "",
+        "Instruction:",
+        "Calculate the weighted average in columns J through L.",
+        "",
+        "Spreadsheet preview:",
+        "('OEM', 'FY')"
+      ].join("\n")
+    }])).toBe("Calculate the weighted average in columns J through L.");
+  });
+
+  it("does not derive artifact families from tool calls or tool results", () => {
+    const features = extractEpisodeSkillFeatures({
+      episodeId: "e1",
+      userId: "u1",
+      rTask: 1,
+      thresholds,
+      turns: [{
+        userText: "Update report.xlsx",
+        assistantText: "Saved the workbook.",
+        toolCalls: [{ name: "python", input: { command: "cat notes.json" } }],
+        toolResults: [{ output: "generated debug.csv" }]
+      }]
+    });
+    expect(features.artifacts).toEqual(["xlsx"]);
+  });
+
   it("refuses to join a no-tool episode into a tool cluster", () => {
     const gate = canJoinCluster(
       { tools: [], artifacts: ["xlsx"], queryVec: [1, 0] },
@@ -180,7 +212,7 @@ describe("trace-direct-skill algorithm", () => {
     expect(decision.reason).toBe("no_cluster_above_fine_threshold");
   });
 
-  it("stays on the coarse family when there is no query vector", () => {
+  it("creates a new cluster when there is no query vector", () => {
     const decision = decideClusterAssignment(
       episodeFeatures({
         episodeId: "e2",
@@ -189,12 +221,25 @@ describe("trace-direct-skill algorithm", () => {
       }),
       [clusterFeatures({ id: "c1", centroid: [1, 0] })]
     );
-    expect(decision).toMatchObject({
-      action: "join",
-      clusterId: "c1",
-      stage: "coarse",
-      reason: "joined_by_coarse_family"
-    });
+    expect(decision).toEqual({ action: "create", reason: "no_cluster_above_fine_threshold" });
+  });
+
+  it("requires the join threshold when only coarse family features are available", () => {
+    const decision = decideClusterAssignment(
+      episodeFeatures({
+        episodeId: "e2",
+        tools: ["python", "bash"],
+        artifacts: ["xlsx"],
+        queryVec: null
+      }),
+      [clusterFeatures({
+        id: "c1",
+        tools: ["python", "node"],
+        artifacts: ["xlsx", "csv"],
+        centroid: null
+      })]
+    );
+    expect(decision.action).toBe("create");
   });
 
   it("selects the newest 3 successes and 3 failures", () => {

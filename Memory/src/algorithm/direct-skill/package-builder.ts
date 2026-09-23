@@ -1,5 +1,5 @@
 import type { LlmClient } from "../../model/types.js";
-import { newId, stableStringify } from "../../utils/id.js";
+import { newId, stableHash, stableStringify } from "../../utils/id.js";
 import { isRecord } from "../../utils/json.js";
 import { StrengthVoter } from "./strength-voter.js";
 import type {
@@ -9,25 +9,18 @@ import type {
   GradedCandidateModule
 } from "./types.js";
 
-const PACKAGE_CONSOLIDATION_PROMPT = `Organize all graded modules in one skill package.
+const PACKAGE_CONSOLIDATION_PROMPT = `Organize the final modules in one skill package.
 
-mergeGroups may merge modules only when semanticKey, type, and strength are equal and scope plus execution contract are compatible.
+The modules have already been merged. Do not merge, delete, invent, or rewrite modules.
 alternativeGroups identify solutions to a similar problem that cannot be used together. Do not merge alternatives.
-Every alternative member must reference either a merge group ID or an unmerged candidate module ID.
-Omit merge or alternative groups that contain fewer than two distinct members.
-Do not invent, delete, or rewrite modules.
+Every alternative member must reference a supplied final module ID.
+Omit alternative groups that contain fewer than two distinct members.
 
 Return JSON only:
 {
   "title": "...", "summary": "...",
-  "mergeGroups": [{ "groupId": "...", "candidateModuleIds": ["..."] }],
   "alternativeGroups": [{ "groupKey": "...", "memberRefs": ["..."] }]
 }`;
-
-interface MergeGroup {
-  groupId: string;
-  candidateModuleIds: string[];
-}
 
 interface AlternativeGroup {
   groupKey: string;
@@ -51,8 +44,9 @@ export class PackageBuilder {
     if (input.candidates.length === 0) throw new Error(`direct-skill cluster ${input.clusterId} has no candidate modules`);
     const packageId = input.packageId ?? newId("dsp");
     const graded = await this.voter.grade(packageId, input.candidates);
-    const organization = await this.consolidate(packageId, graded);
-    const modules = buildFinalModules(graded, organization.mergeGroups, organization.alternativeGroups);
+    const modules = mergeCompatibleCandidates(graded);
+    const organization = await this.consolidate(modules);
+    applyAlternativeGroups(modules, organization.alternativeGroups);
     return {
       schemaVersion: 1,
       packageId,
@@ -66,10 +60,9 @@ export class PackageBuilder {
     };
   }
 
-  private async consolidate(packageId: string, graded: GradedCandidateModule[]): Promise<{
+  private async consolidate(modules: DirectSkillModule[]): Promise<{
     title: string;
     summary: string;
-    mergeGroups: MergeGroup[];
     alternativeGroups: AlternativeGroup[];
   }> {
     const result = await this.llm.completeJson<Record<string, unknown>>([
@@ -77,8 +70,12 @@ export class PackageBuilder {
       {
         role: "user",
         content: stableStringify({
-          packageId,
-          modules: graded.map(({ material, ...candidate }) => ({ candidate, evidenceSummary: material.observation }))
+          modules: modules.map((module) => ({
+            moduleId: module.moduleId,
+            semanticKey: module.semanticKey,
+            type: module.type,
+            instruction: module.instruction
+          }))
         })
       }
     ], {
@@ -90,77 +87,73 @@ export class PackageBuilder {
     return {
       title: requiredText(result.title, "title"),
       summary: requiredText(result.summary, "summary"),
-      mergeGroups: parseGroups(result.mergeGroups, "mergeGroups", "groupId", "candidateModuleIds"),
-      alternativeGroups: parseGroups(result.alternativeGroups, "alternativeGroups", "groupKey", "memberRefs")
+      alternativeGroups: parseAlternativeGroups(result.alternativeGroups)
     };
   }
 }
 
-function buildFinalModules(
-  candidates: GradedCandidateModule[],
-  mergeGroups: MergeGroup[],
-  alternativeGroups: AlternativeGroup[]
-): DirectSkillModule[] {
-  const byId = new Map(candidates.map((candidate) => [candidate.moduleId, candidate]));
-  const consumed = new Set<string>();
-  const unitToModules = new Map<string, DirectSkillModule[]>();
-  const modules: DirectSkillModule[] = [];
-
-  for (const group of mergeGroups) {
-    // A singleton merge proposed by the organizer is a no-op. Keep its
-    // candidate unmerged rather than failing the complete Package build.
-    if (group.candidateModuleIds.length < 2) continue;
-    const members = group.candidateModuleIds.map((id) => {
-      const candidate = byId.get(id);
-      if (!candidate) throw new Error(`direct-skill merge group references unknown module: ${id}`);
-      if (consumed.has(id)) throw new Error(`direct-skill module belongs to multiple merge groups: ${id}`);
-      consumed.add(id);
-      return candidate;
-    });
-    assertMergeCompatible(members);
-    const first = members[0]!;
-    const merged: DirectSkillModule = {
-      ...moduleFields(first),
-      instruction: mergeInstructions(members),
-      moduleId: `dsmg_${group.groupId}`,
-      strength: first.strengthDecision.finalStrength,
-      evidenceRefs: unique(members.flatMap((member) => member.evidenceRefs)),
-      sourceModuleIds: members.map((member) => member.moduleId),
-      strengthDecisions: members.map((member) => member.strengthDecision)
-    };
-    modules.push(merged);
-    unitToModules.set(group.groupId, [merged]);
-  }
-
+function mergeCompatibleCandidates(candidates: GradedCandidateModule[]): DirectSkillModule[] {
+  const groups = new Map<string, GradedCandidateModule[]>();
   for (const candidate of candidates) {
-    if (consumed.has(candidate.moduleId)) continue;
-    const module: DirectSkillModule = {
-      ...moduleFields(candidate),
-      moduleId: candidate.moduleId,
-      strength: candidate.strengthDecision.finalStrength,
-      sourceModuleIds: [candidate.moduleId],
-      strengthDecisions: [candidate.strengthDecision]
-    };
-    modules.push(module);
-    unitToModules.set(candidate.moduleId, [module]);
+    const signature = mergeSignature(candidate);
+    groups.set(signature, [...(groups.get(signature) ?? []), candidate]);
   }
+  return [...groups.values()].map((members) => {
+    const sorted = [...members].sort((left, right) => left.moduleId.localeCompare(right.moduleId));
+    const first = sorted[0]!;
+    return {
+      ...moduleFields(first),
+      instruction: mergeInstructions(sorted),
+      moduleId: sorted.length === 1
+        ? first.moduleId
+        : `dsmg_${stableHash(sorted.map((member) => member.moduleId).join(":")).slice(0, 20)}`,
+      strength: first.strengthDecision.finalStrength,
+      evidenceRefs: unique(sorted.flatMap((member) => member.evidenceRefs)),
+      sourceModuleIds: sorted.map((member) => member.moduleId),
+      strengthDecisions: sorted.map((member) => member.strengthDecision)
+    };
+  });
+}
 
+function applyAlternativeGroups(modules: DirectSkillModule[], alternativeGroups: AlternativeGroup[]): void {
+  const byId = new Map(modules.map((module) => [module.moduleId, module]));
   const assignedAlternative = new Set<string>();
   for (const group of alternativeGroups) {
     if (group.memberRefs.length < 2) continue;
-    for (const ref of group.memberRefs) {
-      const members = unitToModules.get(ref);
-      if (!members) throw new Error(`direct-skill alternative group references unknown unit: ${ref}`);
-      for (const module of members) {
-        if (assignedAlternative.has(module.moduleId)) {
-          throw new Error(`direct-skill module belongs to multiple alternative groups: ${module.moduleId}`);
-        }
-        module.alternativeGroupKey = group.groupKey;
-        assignedAlternative.add(module.moduleId);
-      }
+    const members = group.memberRefs.map((ref) => {
+      const module = byId.get(ref);
+      if (!module) throw new Error(`direct-skill alternative group ${group.groupKey} references unknown module: ${ref}`);
+      return module;
+    });
+    const duplicate = members.find((module) => assignedAlternative.has(module.moduleId));
+    if (duplicate) {
+      throw new Error(`direct-skill module belongs to multiple alternative groups: ${duplicate.moduleId}`);
+    }
+    for (const module of members) {
+      module.alternativeGroupKey = group.groupKey;
+      assignedAlternative.add(module.moduleId);
     }
   }
-  return modules;
+}
+
+function mergeSignature(candidate: GradedCandidateModule): string {
+  return stableStringify({
+    semanticKey: candidate.semanticKey,
+    type: candidate.type,
+    strength: candidate.strengthDecision.finalStrength,
+    scope: {
+      tasks: sortedUnique(candidate.scope.tasks),
+      tools: sortedUnique(candidate.scope.tools),
+      resources: sortedUnique(candidate.scope.resources),
+      operations: sortedUnique(candidate.scope.operations)
+    },
+    triggerEvents: sortedUnique(candidate.triggerEvents),
+    completionRule: candidate.completionRule ?? null,
+    requiredEvidence: sortedUnique(candidate.requiredEvidence),
+    recovery: candidate.recovery ?? null,
+    authority: candidate.authority,
+    evidencePattern: candidate.evidencePattern
+  });
 }
 
 function mergeInstructions(members: GradedCandidateModule[]): string {
@@ -191,51 +184,21 @@ function moduleFields(candidate: GradedCandidateModule) {
   };
 }
 
-function assertMergeCompatible(members: GradedCandidateModule[]): void {
-  const first = members[0]!;
-  const contract = stableStringify({
-    scope: first.scope,
-    triggerEvents: [...first.triggerEvents].sort(),
-    completionRule: first.completionRule ?? null,
-    requiredEvidence: first.requiredEvidence,
-    recovery: first.recovery ?? null
-  });
-  for (const member of members.slice(1)) {
-    if (
-      member.semanticKey !== first.semanticKey ||
-      member.type !== first.type ||
-      member.strengthDecision.finalStrength !== first.strengthDecision.finalStrength
-    ) {
-      throw new Error("direct-skill merge group contains different semanticKey, type, or strength");
-    }
-    const nextContract = stableStringify({
-      scope: member.scope,
-      triggerEvents: [...member.triggerEvents].sort(),
-      completionRule: member.completionRule ?? null,
-      requiredEvidence: member.requiredEvidence,
-      recovery: member.recovery ?? null
-    });
-    if (nextContract !== contract) throw new Error("direct-skill merge group contains incompatible scope or contract");
-  }
-}
-
-function parseGroups<TName extends "groupId" | "groupKey", TMembers extends "candidateModuleIds" | "memberRefs">(
-  value: unknown,
-  field: string,
-  nameField: TName,
-  membersField: TMembers
-): Array<Record<TName, string> & Record<TMembers, string[]>> {
-  if (!Array.isArray(value)) throw new Error(`direct-skill ${field} must be an array`);
+function parseAlternativeGroups(value: unknown): AlternativeGroup[] {
+  if (!Array.isArray(value)) throw new Error("direct-skill alternativeGroups must be an array");
   const names = new Set<string>();
   return value.map((item) => {
-    if (!isRecord(item)) throw new Error(`direct-skill ${field} contains invalid entry`);
-    const name = requiredText(item[nameField], `${field}.${nameField}`);
-    if (names.has(name)) throw new Error(`direct-skill ${field} duplicated ${name}`);
+    if (!isRecord(item)) throw new Error("direct-skill alternativeGroups contains invalid entry");
+    const name = requiredText(item.groupKey, "alternativeGroups.groupKey");
+    if (names.has(name)) throw new Error(`direct-skill alternativeGroups duplicated ${name}`);
     names.add(name);
-    if (!Array.isArray(item[membersField]) || item[membersField].some((entry) => typeof entry !== "string" || !entry.trim())) {
-      throw new Error(`direct-skill ${field}.${membersField} must be a string array`);
+    if (!Array.isArray(item.memberRefs) || item.memberRefs.some((entry) => typeof entry !== "string" || !entry.trim())) {
+      throw new Error("direct-skill alternativeGroups.memberRefs must be a string array");
     }
-    return { [nameField]: name, [membersField]: unique((item[membersField] as string[]).map((entry) => entry.trim())) } as Record<TName, string> & Record<TMembers, string[]>;
+    return {
+      groupKey: name,
+      memberRefs: unique((item.memberRefs as string[]).map((entry) => entry.trim()))
+    };
   });
 }
 
@@ -246,4 +209,8 @@ function requiredText(value: unknown, field: string): string {
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
+}
+
+function sortedUnique<T extends string>(values: T[]): T[] {
+  return [...new Set(values)].sort();
 }

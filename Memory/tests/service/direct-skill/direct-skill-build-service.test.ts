@@ -202,6 +202,37 @@ describe("DirectSkillBuildService", () => {
     expect(persist).toHaveBeenCalledTimes(1);
   });
 
+  it("can stop after Cluster construction without extracting Modules", async () => {
+    const episodes = new Map([
+      ["episode-a", buildEpisode("episode-a")],
+      ["episode-b", buildEpisode("episode-b")]
+    ]);
+    const deps = buildDeps(episodes);
+    const service = new DirectSkillBuildService(deps);
+    const internals = service as unknown as {
+      clusterPipeline: { assignEpisodeForDirectBuild(episodeId: string): Promise<string> };
+      buildPackageValue(): Promise<unknown>;
+    };
+    internals.clusterPipeline.assignEpisodeForDirectBuild = async (episodeId) =>
+      episodeId === "episode-a" ? "cluster-a" : "cluster-b";
+    const buildPackage = vi.fn(async () => { throw new Error("must not build Package"); });
+    internals.buildPackageValue = buildPackage;
+
+    const result = await service.build({
+      episodeIds: [...episodes.keys()],
+      builder: "package_v1",
+      clusterOnly: true
+    });
+
+    expect(result).toEqual({
+      episodeCount: 2,
+      clusterIds: ["cluster-a", "cluster-b"],
+      builtMemoryIds: [],
+      failures: []
+    });
+    expect(buildPackage).not.toHaveBeenCalled();
+  });
+
   it("bounds parallel Package construction by clusterConcurrency", async () => {
     const episodes = new Map(Array.from({ length: 6 }, (_, index) => {
       const id = `episode-${index}`;

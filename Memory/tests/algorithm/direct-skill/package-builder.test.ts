@@ -31,11 +31,16 @@ describe("PackageBuilder", () => {
           reason: "actionable advice"
         })) };
       }
+      const modules = payload.modules as Array<Record<string, unknown>>;
+      expect(modules).toHaveLength(2);
+      expect(Object.keys(modules[0]!).sort()).toEqual(["instruction", "moduleId", "semanticKey", "type"]);
       return {
         title: "Workbook repair",
         summary: "Repair and verify spreadsheet writes.",
-        mergeGroups: [{ groupId: "verify", candidateModuleIds: ["m1", "m2"] }],
-        alternativeGroups: [{ groupKey: "repair_choice", memberRefs: ["verify", "m3"] }]
+        alternativeGroups: [{
+          groupKey: "repair_choice",
+          memberRefs: modules.map((module) => module.moduleId)
+        }]
       };
     });
     const result = await new PackageBuilder(llm).build({
@@ -60,7 +65,7 @@ describe("PackageBuilder", () => {
     ].join("\n"));
   });
 
-  it("keeps modules unmerged when the organizer emits singleton groups", async () => {
+  it("ignores legacy merge groups and keeps incompatible modules separate", async () => {
     const llm = fakeLlm(async (messages, options) => {
       const payload = JSON.parse(messages[1]!.content) as Record<string, unknown>;
       if (options.operation === "direct_skill.strength.review") {
@@ -78,8 +83,8 @@ describe("PackageBuilder", () => {
       return {
         title: "Workbook repair",
         summary: "Repair and verify spreadsheet writes.",
-        mergeGroups: [{ groupId: "noop", candidateModuleIds: ["m1"] }],
-        alternativeGroups: [{ groupKey: "noop_choice", memberRefs: ["m2"] }]
+        mergeGroups: [{ groupId: "invalid", candidateModuleIds: ["m1", "m2"] }],
+        alternativeGroups: []
       };
     });
     const result = await new PackageBuilder(llm).build({
@@ -91,6 +96,37 @@ describe("PackageBuilder", () => {
     });
     expect(result.modules.map((module) => module.moduleId)).toEqual(["m1", "m2"]);
     expect(result.modules.every((module) => module.alternativeGroupKey === undefined)).toBe(true);
+  });
+
+  it("rejects an alternative group that references an unknown final module", async () => {
+    const llm = fakeLlm(async (messages, options) => {
+      const payload = JSON.parse(messages[1]!.content) as Record<string, unknown>;
+      if (options.operation === "direct_skill.strength.review") {
+        const candidates = payload.candidates as Array<{ candidate: { moduleId: string } }>;
+        return { votes: candidates.map(({ candidate }) => ({
+          moduleId: candidate.moduleId,
+          constraintMode: "advisory",
+          guideSpecificity: "actionable",
+          authority: "task_evidence",
+          observability: "trace_observable",
+          strength: "L2",
+          reason: "actionable advice"
+        })) };
+      }
+      return {
+        title: "Workbook guidance",
+        summary: "Verify or repair spreadsheet writes.",
+        alternativeGroups: [{ groupKey: "invalid", memberRefs: ["m1", "missing"] }]
+      };
+    });
+
+    await expect(new PackageBuilder(llm).build({
+      packageId: "package-invalid-merge",
+      clusterId: "cluster-invalid-merge",
+      candidates: [candidate("m1", "verify_save"), candidate("m2", "repair_save")],
+      sourceEpisodeIds: ["e1"],
+      createdAt: "2026-01-01T00:00:00.000Z"
+    })).rejects.toThrow("alternative group invalid references unknown module: missing");
   });
 });
 

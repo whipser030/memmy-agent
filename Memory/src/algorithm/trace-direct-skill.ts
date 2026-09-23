@@ -23,9 +23,9 @@ export const ARTIFACT_EXTENSIONS = [
 
 export const DEFAULT_DIRECT_SKILL_CLUSTERING = {
   /** Fine-cluster cosine floor inside a tool/artifact family. */
-  joinThreshold: 0.5,
+  joinThreshold: 0.72,
   /** Cosine floor when both sides have no tools and no artifacts. */
-  joinThresholdEmpty: 0.7,
+  joinThresholdEmpty: 0.82,
   toolJaccardFloor: 0.4,
   artifactJaccardFloor: 0.3,
   batchSuccessLimit: 3,
@@ -280,6 +280,14 @@ export function firstUserQuery(turns: RawTurnLike[]): string {
   return "";
 }
 
+export function extractTaskQuery(turns: RawTurnLike[]): string {
+  const query = firstUserQuery(turns);
+  const instruction = query.match(
+    /(?:^|\n)Instruction:\s*\n?([\s\S]*?)(?=\n\s*\n(?:Spreadsheet preview|Instruction type|Answer position):|\s*$)/i
+  )?.[1]?.trim();
+  return instruction || query;
+}
+
 export function extractEpisodeSkillFeatures(input: {
   episodeId: string;
   userId: string;
@@ -293,12 +301,7 @@ export function extractEpisodeSkillFeatures(input: {
   const artifacts = new Set<string>();
   for (const turn of input.turns) {
     for (const name of extractToolNames(turn.toolCalls)) toolsInOrder.push(name);
-    for (const artifact of extractArtifactTypes(
-      turn.userText,
-      turn.assistantText,
-      stringifyUnknown(turn.toolCalls),
-      stringifyUnknown(turn.toolResults)
-    )) {
+    for (const artifact of extractArtifactTypes(turn.userText, turn.assistantText)) {
       artifacts.add(artifact);
     }
   }
@@ -310,7 +313,7 @@ export function extractEpisodeSkillFeatures(input: {
     tools,
     artifacts: [...artifacts].sort(),
     toolBigrams: toolBigrams(toolsInOrder),
-    queryText: firstUserQuery(input.turns),
+    queryText: extractTaskQuery(input.turns),
     queryVec: input.queryVec ?? null,
     outcome: classifySkillOutcome(input.rTask, input.thresholds),
     rTask: input.rTask
@@ -401,12 +404,7 @@ export function scoreClusterJoin(
     return { score: vec, reason: "fine_vec", bothEmpty: false, stage: "fine" };
   }
 
-  return {
-    score: coarseFamilyScore(episode, cluster),
-    reason: "coarse_family_only",
-    bothEmpty: false,
-    stage: "coarse"
-  };
+  return { score: null, reason: "missing_query_vec", bothEmpty: false, stage: "fine" };
 }
 
 export function decideClusterAssignment(
@@ -427,9 +425,7 @@ export function decideClusterAssignment(
     if (scored.score === null) continue;
     const tau = scored.bothEmpty
       ? config.joinThresholdEmpty
-      : scored.stage === "fine"
-        ? config.joinThreshold
-        : 0;
+      : config.joinThreshold;
     if (scored.score < tau) continue;
     if (!best || scored.score > best.score) {
       best = {

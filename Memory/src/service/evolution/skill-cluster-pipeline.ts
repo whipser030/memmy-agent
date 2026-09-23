@@ -12,7 +12,7 @@ import {
   decideEvolveBranch,
   evidenceToolNames,
   extractEpisodeSkillFeatures,
-  firstUserQuery,
+  extractTaskQuery,
   isEvalSplitTest,
   mergeCentroid,
   mergeProcedureByScope,
@@ -411,7 +411,7 @@ export class SkillClusterPipeline {
 
   private async featuresForEpisode(episode: EpisodeRecord): Promise<EpisodeSkillFeatures> {
     const turns = this.deps.repos.runtime.listRawTurnsByEpisode(episode.id, 1000);
-    const queryText = firstUserQuery(turns);
+    const queryText = extractTaskQuery(turns);
     let queryVec: number[] | null = null;
     if (queryText && this.deps.queryVector) {
       try {
@@ -456,13 +456,14 @@ export class SkillClusterPipeline {
     const alreadyMember = this.deps.repos.runtime
       .listSkillClusterMembers(cluster.id)
       .some((member) => member.episodeId === features.episodeId);
+    if (alreadyMember) return cluster;
     const next: SkillClusterRecord = {
       ...cluster,
       tools: uniqSorted([...cluster.tools, ...features.tools]),
       artifacts: uniqSorted([...cluster.artifacts, ...features.artifacts]),
       toolBigrams: uniqSorted([...cluster.toolBigrams, ...features.toolBigrams]),
       centroid: mergeCentroid(cluster.centroid, features.queryVec, cluster.memberCount),
-      memberCount: alreadyMember ? cluster.memberCount : cluster.memberCount + 1,
+      memberCount: cluster.memberCount + 1,
       updatedAt: at
     };
     return this.deps.repos.runtime.updateSkillCluster(next);

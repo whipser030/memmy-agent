@@ -137,7 +137,97 @@ describe("ModuleExtractor", () => {
       summary: "saved",
       toolSteps: [],
       evaluation: { rTask: 1, detail: {} }
-    })).rejects.toThrow("hard constraint requires aligned authority evidence");
+    })).rejects.toThrow(
+      "hard constraint authorityEvidence is invalid, semanticKey=invented_constraint, " +
+      "reason=direct-skill authority statement is not present in source evidence"
+    );
+  });
+
+  it("repairs an invalid module without discarding valid modules from the same response", async () => {
+    const operations: string[] = [];
+    const validModule = {
+      material: {
+        subgoal: "save",
+        outcome: "success",
+        observation: "saved",
+        proposedAction: "reopen the saved workbook",
+        scopeClues: ["xlsx"],
+        evidenceRefs: ["turn-1"],
+        authorityEvidence: null
+      },
+      candidateModule: {
+        semanticKey: "reopen_workbook",
+        type: "verification",
+        instruction: "Reopen the saved workbook.",
+        scope: { tasks: ["spreadsheet"], tools: [], resources: ["xlsx"], operations: ["verify"] },
+        triggerEvents: ["before_submit"],
+        completionRule: "Workbook opens.",
+        requiredEvidence: ["successful reopen"],
+        recovery: "Repair and save again.",
+        evidenceRefs: ["turn-1"],
+        authority: "task_evidence",
+        evidencePattern: "single_observation"
+      }
+    };
+    const invalidHardModule = {
+      material: {
+        subgoal: "save",
+        outcome: "success",
+        observation: "formula preservation is required",
+        proposedAction: "preserve formulas",
+        scopeClues: ["xlsx"],
+        evidenceRefs: ["turn-1"],
+        authorityEvidence: null
+      },
+      candidateModule: {
+        semanticKey: "preserve_formulas",
+        type: "invariant",
+        instruction: "Do not overwrite formulas.",
+        scope: { tasks: ["spreadsheet"], tools: [], resources: ["xlsx"], operations: ["write"] },
+        triggerEvents: ["turn_start"],
+        completionRule: "Formulas remain formulas.",
+        requiredEvidence: ["formula cells"],
+        recovery: "Restore formulas from the source.",
+        evidenceRefs: ["turn-1"],
+        authority: "task_hard_constraint",
+        evidencePattern: "explicit_statement"
+      }
+    };
+    const llm = fakeLlm(async (_messages, options) => {
+      operations.push(options.operation);
+      if (options.operation === "direct_skill.module.repair") {
+        return {
+          modules: [{
+            ...invalidHardModule,
+            material: {
+              ...invalidHardModule.material,
+              authorityEvidence: { statement: "Do not overwrite formulas", evidenceRef: "turn-1" }
+            }
+          }]
+        };
+      }
+      return { decision: "accept", modules: [validModule, invalidHardModule] };
+    });
+
+    const result = await new ModuleExtractor(llm).extractFromTurn({
+      sourceType: "turn",
+      sourceId: "turn-1",
+      episodeId: "episode-1",
+      outcome: "success",
+      userRequest: "Do not overwrite formulas while saving.",
+      assistantFinalAnswer: "Saved.",
+      subgoal: "save",
+      summary: "saved",
+      toolSteps: [],
+      evaluation: { rTask: 1, detail: {} }
+    });
+
+    expect(operations).toEqual(["direct_skill.module.extract_turn", "direct_skill.module.repair"]);
+    expect(result.decision).toBe("accept");
+    if (result.decision === "accept") {
+      expect(result.modules.map((item) => item.candidateModule.semanticKey))
+        .toEqual(["reopen_workbook", "preserve_formulas"]);
+    }
   });
 
   it("ignores unused invalid authority evidence on a non-hard module", async () => {
@@ -187,7 +277,8 @@ describe("ModuleExtractor", () => {
 
 function fakeLlm(
   completeJson: (
-    messages: Array<{ role: "system" | "user" | "assistant"; content: string }>
+    messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+    options: { operation: string }
   ) => Promise<Record<string, unknown>>
 ): LlmClient {
   return {

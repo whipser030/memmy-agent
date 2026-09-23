@@ -558,11 +558,18 @@ async function routeRequest(
         "direct-skills.build.resumeExistingPackages must be a boolean"
       );
     }
+    if (request.clusterOnly !== undefined && typeof request.clusterOnly !== "boolean") {
+      throw new MemoryServiceError(
+        "invalid_argument",
+        "direct-skills.build.clusterOnly must be a boolean"
+      );
+    }
     return service.buildDirectSkills({
       episodeIds,
       builder: request.builder,
       clusterConcurrency: request.clusterConcurrency,
-      resumeExistingPackages: request.resumeExistingPackages
+      resumeExistingPackages: request.resumeExistingPackages,
+      clusterOnly: request.clusterOnly
     });
   }
   if (method === "POST" && path === "/api/v1/admin/shutdown") {

@@ -1,7 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_MEMMY_CONFIG, type LlmClient } from "../../../src/index.js";
 import { DIRECT_SKILL_SOURCE } from "../../../src/algorithm/trace-direct-skill.js";
 import { Repositories } from "../../../src/storage/repositories.js";
+import {
+  SkillClusterPipeline,
+  type SkillClusterPipelineDeps
+} from "../../../src/service/evolution/skill-cluster-pipeline.js";
 import { createMemoryServiceFixture, runWorkerRounds } from "../../fixtures/memory-service-fixture.js";
 
 const {
@@ -385,5 +389,54 @@ describe("MemoryService / evolution / skill cluster", () => {
       skill_memory_id: string;
     };
     expect(cluster.skill_memory_id).not.toBe(l2SkillId);
+  });
+
+  it("does not update cluster features when the episode is already a member", () => {
+    const updateSkillCluster = vi.fn();
+    const pipeline = new SkillClusterPipeline({
+      repos: {
+        runtime: {
+          listSkillClusterMembers: () => [{ episodeId: "episode-1" }],
+          updateSkillCluster
+        }
+      }
+    } as unknown as SkillClusterPipelineDeps);
+    const cluster = {
+      id: "cluster-1",
+      userId: "user-1",
+      tools: ["python"],
+      artifacts: ["xlsx"],
+      toolBigrams: [],
+      centroid: [1, 0],
+      metaSkillMd: "",
+      processedEpisodeIds: [],
+      memberCount: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z"
+    };
+    const refresh = (pipeline as unknown as {
+      refreshClusterFeatures(
+        clusterValue: typeof cluster,
+        features: {
+          episodeId: string;
+          tools: string[];
+          artifacts: string[];
+          toolBigrams: string[];
+          queryVec: number[];
+        },
+        at: string
+      ): typeof cluster;
+    }).refreshClusterFeatures.bind(pipeline);
+
+    const result = refresh(cluster, {
+      episodeId: "episode-1",
+      tools: ["python", "read"],
+      artifacts: ["xlsx", "json"],
+      toolBigrams: ["python>read"],
+      queryVec: [0, 1]
+    }, "2026-01-02T00:00:00.000Z");
+
+    expect(result).toBe(cluster);
+    expect(updateSkillCluster).not.toHaveBeenCalled();
   });
 });

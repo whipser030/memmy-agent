@@ -7,6 +7,7 @@ import type {
 } from "../../algorithm/direct-skill/types.js";
 import { classifySkillOutcome, isEvalSplitTest } from "../../algorithm/trace-direct-skill.js";
 import type { MemmyConfig } from "../../config/index.js";
+import { createMemoryLogger, memoryErrorFields } from "../../logging/logger.js";
 import type { LlmClient } from "../../model/types.js";
 import {
   type EpisodeRecord,
@@ -27,11 +28,14 @@ import {
 } from "../evolution/big-turn-span-pipeline.js";
 import { SkillClusterPipeline } from "../evolution/skill-cluster-pipeline.js";
 
+const directSkillBuildLogger = createMemoryLogger("direct-skill-build");
+
 export interface DirectSkillBuildRequest {
   episodeIds: string[];
   builder: "legacy" | "package_v1";
   clusterConcurrency?: number;
   resumeExistingPackages?: boolean;
+  clusterOnly?: boolean;
 }
 
 export interface DirectSkillBuildResult {
@@ -98,6 +102,9 @@ export class DirectSkillBuildService {
     if (request.builder !== "legacy" && request.builder !== "package_v1") {
       throw new Error(`unsupported direct-skill builder: ${String(request.builder)}`);
     }
+    if (request.clusterOnly && request.builder !== "package_v1") {
+      throw new Error("direct-skill clusterOnly requires package_v1 builder");
+    }
     const episodes = episodeIds.map((episodeId) => {
       const episode = this.deps.repos.runtime.getEpisode(episodeId);
       if (!episode) throw new Error(`direct-skill Episode not found: ${episodeId}`);
@@ -116,11 +123,12 @@ export class DirectSkillBuildService {
     const failures: DirectSkillBuildResult["failures"] = [];
     const sourceByEpisode = new Map<string, TurnBuildSource[]>();
 
-    if (request.builder === "package_v1") {
+    if (request.builder === "package_v1" && !request.clusterOnly) {
       for (const episode of episodes) {
         try {
           sourceByEpisode.set(episode.id, await this.prepareEpisodeSources(episode.id, episode.rTask!, at));
         } catch (error) {
+          logDirectSkillFailure("direct_skill.source_preparation", error, { episodeId: episode.id });
           failures.push({ episodeId: episode.id, reason: errorMessage(error) });
         }
       }
@@ -149,6 +157,7 @@ export class DirectSkillBuildService {
         clusterIds.add(clusterId);
         episodeIdsByCluster.set(clusterId, [...(episodeIdsByCluster.get(clusterId) ?? []), episode.id]);
       } catch (error) {
+        logDirectSkillFailure("direct_skill.cluster_assignment", error, { episodeId: episode.id });
         failures.push({ episodeId: episode.id, reason: errorMessage(error) });
       }
     }
@@ -160,6 +169,14 @@ export class DirectSkillBuildService {
         failures
       };
     }
+    if (request.clusterOnly) {
+      return {
+        episodeCount: episodes.length,
+        clusterIds: [...clusterIds].sort(),
+        builtMemoryIds: [],
+        failures: []
+      };
+    }
 
     const sortedClusterIds = [...clusterIds].sort();
     const builtMemoryIds: string[] = [];
@@ -169,6 +186,7 @@ export class DirectSkillBuildService {
           const memoryId = await this.clusterPipeline.buildLegacyClusterForDirectBuild(clusterId, at);
           if (memoryId) builtMemoryIds.push(memoryId);
         } catch (error) {
+          logDirectSkillFailure("direct_skill.legacy_package_build", error, { clusterId });
           failures.push({ clusterId, reason: errorMessage(error) });
         }
       }
@@ -190,6 +208,7 @@ export class DirectSkillBuildService {
           );
           return { clusterId, memoryId: persisted.id };
         } catch (error) {
+          logDirectSkillFailure("direct_skill.package_build", error, { clusterId });
           return { clusterId, reason: errorMessage(error) };
         }
       });
@@ -250,24 +269,45 @@ export class DirectSkillBuildService {
       const normalizedOutcome = outcome === "unknown" ? "mixed" : outcome;
       for (const source of sourceByEpisode.get(episodeId) ?? []) {
         if (source.spans.length === 0) {
-          const result = await this.extractor.extractFromTurn(turnExtractionSource(source.rawTurn, episode, normalizedOutcome));
-          if (result.decision === "accept") candidates.push(...result.modules.map((item) => item.candidateModule));
+          try {
+            const result = await this.extractor.extractFromTurn(turnExtractionSource(source.rawTurn, episode, normalizedOutcome));
+            if (result.decision === "accept") candidates.push(...result.modules.map((item) => item.candidateModule));
+          } catch (error) {
+            throw new Error(
+              `direct-skill Module extraction failed: episodeId=${episodeId}, sourceType=turn, ` +
+              `sourceId=${source.rawTurn.id}, reason=${errorMessage(error)}`
+            );
+          }
           continue;
         }
         for (const span of source.spans) {
-          const result = await this.extractor.extractFromSpan(spanExtractionSource(span, source.rawTurn, episode, normalizedOutcome));
-          if (result.decision === "accept") candidates.push(...result.modules.map((item) => item.candidateModule));
+          try {
+            const result = await this.extractor.extractFromSpan(spanExtractionSource(span, source.rawTurn, episode, normalizedOutcome));
+            if (result.decision === "accept") candidates.push(...result.modules.map((item) => item.candidateModule));
+          } catch (error) {
+            throw new Error(
+              `direct-skill Module extraction failed: episodeId=${episodeId}, sourceType=span, ` +
+              `sourceId=${span.spanId}, reason=${errorMessage(error)}`
+            );
+          }
         }
       }
     }
     const packageId = newId("dsp");
-    const packageValue = await this.packageBuilder.build({
-      packageId,
-      clusterId,
-      candidates: filterFailureUnsupportedCandidates(candidates),
-      sourceEpisodeIds: episodeIds,
-      createdAt: at
-    });
+    let packageValue: DirectSkillPackage;
+    try {
+      packageValue = await this.packageBuilder.build({
+        packageId,
+        clusterId,
+        candidates: filterFailureUnsupportedCandidates(candidates),
+        sourceEpisodeIds: episodeIds,
+        createdAt: at
+      });
+    } catch (error) {
+      throw new Error(
+        `direct-skill Package assembly failed: clusterId=${clusterId}, reason=${errorMessage(error)}`
+      );
+    }
     return { cluster, packageValue };
   }
 
@@ -482,6 +522,18 @@ function unique(values: string[]): string[] {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : stableStringify(error);
+}
+
+function logDirectSkillFailure(
+  stage: string,
+  error: unknown,
+  context: { clusterId?: string; episodeId?: string }
+): void {
+  directSkillBuildLogger.error("build.failed", {
+    stage,
+    ...context,
+    ...memoryErrorFields(error)
+  });
 }
 
 function validateClusterConcurrency(value: number | undefined): number {
