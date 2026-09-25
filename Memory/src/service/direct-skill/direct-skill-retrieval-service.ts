@@ -258,7 +258,11 @@ export function packageFromMemory(memory: {
     isRecord(module) && typeof module.moduleId === "string" && module.moduleId.trim().length > 0
   );
   if (modules.length !== value.modules.length) return null;
-  return value as unknown as DirectSkillPackage;
+  const skillPackage = value as unknown as DirectSkillPackage;
+  const retrievableModules = skillPackage.modules.filter((module) => module.strength !== "L4");
+  if (retrievableModules.length === 0) return null;
+  return retrievableModules.length === skillPackage.modules.length
+    ? skillPackage : { ...skillPackage, modules: retrievableModules };
 }
 
 function uniqueNonEmpty(values: readonly string[]): string[] {

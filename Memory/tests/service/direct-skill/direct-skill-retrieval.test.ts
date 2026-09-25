@@ -7,7 +7,11 @@ import {
 } from "../../../src/service/direct-skill/direct-skill-retrieval-service.js";
 import { directSkillExcludedTags } from "../../../src/service/retrieval/retrieval-service.js";
 
-function module(moduleId: string, alternativeGroupKey?: string): DirectSkillModule {
+function module(
+  moduleId: string,
+  alternativeGroupKey?: string,
+  strength: DirectSkillModule["strength"] = "L2"
+): DirectSkillModule {
   return {
     moduleId,
     semanticKey: moduleId,
@@ -19,7 +23,7 @@ function module(moduleId: string, alternativeGroupKey?: string): DirectSkillModu
     evidenceRefs: ["span_1"],
     authority: "task_evidence",
     evidencePattern: "single_observation",
-    strength: "L2",
+    strength,
     alternativeGroupKey,
     sourceModuleIds: [moduleId],
     strengthDecisions: []
@@ -76,6 +80,42 @@ describe("Direct Skill retrieval boundaries", () => {
       ...base,
       properties: { internal_info: { ...base.properties.internal_info, runtime_managed: "other" } }
     })).toBeNull();
+  });
+
+  it("filters L4 Modules from retrieved packages without changing stored L1-L3 Modules", () => {
+    const value: DirectSkillPackage = {
+      schemaVersion: 1,
+      packageId: "dsp_mixed",
+      clusterId: "cluster_mixed",
+      title: "Mixed strength package",
+      summary: "Contains all strength levels",
+      status: "frozen",
+      modules: [
+        module("m1", undefined, "L1"),
+        module("m2", undefined, "L2"),
+        module("m3", undefined, "L3"),
+        module("m4", undefined, "L4")
+      ],
+      sourceEpisodeIds: ["episode_1"],
+      createdAt: "2026-01-01T00:00:00.000Z"
+    };
+    const memory = {
+      id: value.packageId,
+      tags: ["skill", "direct-skill-package"],
+      properties: {
+        internal_info: {
+          runtime_managed: "direct_skill_v1",
+          direct_skill_package: value
+        }
+      }
+    };
+
+    expect(packageFromMemory(memory)?.modules.map((item) => item.strength))
+      .toEqual(["L1", "L2", "L3"]);
+    expect(value.modules.map((item) => item.strength)).toEqual(["L1", "L2", "L3", "L4"]);
+
+    memory.properties.internal_info.direct_skill_package = { ...value, modules: [module("m4", undefined, "L4")] };
+    expect(packageFromMemory(memory)).toBeNull();
   });
 
   it("rejects IDs outside the candidate set and mutually exclusive selections", () => {
