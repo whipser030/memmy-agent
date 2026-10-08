@@ -31,9 +31,11 @@ function runKey(event = {}, ctx = {}) {
 async function ensureSession(ctx) {
   const key = contextKey(ctx);
   if (sessions.has(key)) return sessions.get(key);
+  const sessionSuffix = stringValue(process.env.MEMMY_SESSION_ID_SUFFIX);
+  const memorySessionId = sessionSuffix ? `openclaw:${key}:${sessionSuffix}` : `openclaw:${key}`;
   const opened = await request("/sessions/open", {
     method: "POST", profileId: profile(ctx),
-    body: { sessionId: `openclaw:${key}`, workspacePath: ctx.workspaceDir || ctx.agentDir, meta: { host: "openclaw" } },
+    body: { sessionId: memorySessionId, workspacePath: ctx.workspaceDir || ctx.agentDir, meta: { host: "openclaw" } },
   });
   sessions.set(key, opened.sessionId);
   return opened.sessionId;
@@ -54,6 +56,32 @@ function forgetTurn(state) {
   for (const [key, value] of turns.entries()) {
     if (value === state) turns.delete(key);
   }
+}
+
+function eventFailed(event = {}) {
+  const status = stringValue(event.status)?.toLowerCase();
+  return Boolean(
+    event.error
+    || event.isError === true
+    || event.success === false
+    || ["error", "failed", "aborted", "timeout", "timed_out"].includes(status)
+  );
+}
+
+async function completeTurn(state, ctx, answer, status) {
+  forgetTurn(state);
+  await request(`/turns/${encodeURIComponent(state.turnId)}/complete`, {
+    method: "POST", timeout: 10000, profileId: profile(ctx),
+    body: {
+      sessionId: state.sessionId,
+      query: state.query,
+      answer,
+      status,
+      toolCalls: state.toolCalls,
+      toolResults: state.toolResults,
+      directSkillInterventions: state.directSkillInterventions,
+    },
+  });
 }
 
 function flattenMessages(messages) {
@@ -301,7 +329,12 @@ function register(api) {
         body: { query, toolNames: [], workspace: ctx.workspaceDir || ctx.cwd },
       });
       state.skillPackage = normalizePackage(routed.package || routed.skillPackage);
-      debug(`route package=${state.skillPackage?.packageId || "none"}`);
+      debug(
+        `route package=${state.skillPackage?.packageId || "none"}`
+        + ` reason=${stringValue(routed.reason) || "unknown"}`
+        + ` candidates=${Number.isInteger(routed.candidateCount) ? routed.candidateCount : "unknown"}`
+        + ` mode=${stringValue(routed.directMode) || "unknown"}`
+      );
       if (state.skillPackage) {
         const selected = await selectDirectModules(state, { eventTypes: ["turn_start"], occurredAt: new Date().toISOString() }, ctx, event.messages);
         if (selected) state.initialContext = [state.initialContext, selected.content].filter(Boolean).join("\n\n");
@@ -316,34 +349,44 @@ function register(api) {
     const active = findTurn(event, ctx);
     if (!active) return;
     const messages = flattenMessages(event?.messages);
-    const answer = [...messages].reverse().find((message) => message.role !== "user" && message.role !== "tool")?.text || String(event?.output || "");
-    forgetTurn(active);
+    const assistantText = [...messages].reverse().find((message) => message.role !== "user" && message.role !== "tool")?.text;
+    const errorDetail = event?.error ? ` Error: ${summarize(event.error)}` : "";
+    const answer = stringValue(assistantText)
+      || stringValue(event?.output)
+      || `Agent ended without a final assistant answer.${errorDetail}`;
     try {
-      await request(`/turns/${encodeURIComponent(active.turnId)}/complete`, {
-        method: "POST", timeout: 10000, profileId: profile(ctx),
-        body: {
-          sessionId: active.sessionId,
-          query: active.query,
-          answer,
-          status: event?.error || event?.success === false ? "failed" : "succeeded",
-          toolCalls: active.toolCalls,
-          toolResults: active.toolResults,
-          directSkillInterventions: active.directSkillInterventions,
-        },
-      });
+      await completeTurn(active, ctx, answer, eventFailed(event) ? "failed" : "succeeded");
     } catch (error) {
       api.logger?.warn?.(`memmy-memory turn completion unavailable: ${error.message}`);
     }
   });
-  api.on("session_end", (_event, ctx) => {
+  api.on("session_end", async (_event, ctx) => {
     const key = contextKey(ctx);
     const id = sessions.get(key);
     sessions.delete(key);
     const active = turns.get(`session:${key}`);
-    if (active) forgetTurn(active);
-    if (id) void request(`/sessions/${encodeURIComponent(id)}/close`, { method: "POST", profileId: profile(ctx), body: {} }).catch(() => undefined);
+    if (active) {
+      try {
+        await completeTurn(active, ctx, "Session ended before OpenClaw emitted a terminal agent result.", "failed");
+      } catch (error) {
+        api.logger?.warn?.(`memmy-memory incomplete turn completion unavailable: ${error.message}`);
+      }
+    }
+    if (id) await request(`/sessions/${encodeURIComponent(id)}/close`, { method: "POST", profileId: profile(ctx), body: {} }).catch(() => undefined);
   });
-  api.registerService?.({ id: "memmy-memory", name: "memmy-memory", async start() { await request("/health"); }, async stop() {} });
+  api.registerService?.({
+    id: "memmy-memory",
+    name: "memmy-memory",
+    async start() {
+      const health = await request("/health");
+      const directSkillMode = stringValue(health?.capabilities?.directSkillMode);
+      if (directSkillOnly && directSkillMode !== "package_v1") {
+        throw new Error(`Memmy direct-skill-only adapter requires algorithm.skill.directMode=package_v1; server reported ${directSkillMode || "unknown"}`);
+      }
+      debug(`service ready directSkillMode=${directSkillMode || "unknown"}`);
+    },
+    async stop() {}
+  });
 }
 
 function uniqueStrings(value) {

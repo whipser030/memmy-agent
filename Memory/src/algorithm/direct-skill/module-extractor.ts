@@ -292,8 +292,13 @@ function parseCandidate(
     throw new Error("direct-skill semanticKey must be stable snake_case");
   }
   const evidenceRefs = parseEvidenceRefs(value.evidenceRefs, "candidateModule.evidenceRefs", source);
-  if (evidenceRefs.some((ref) => !material.evidenceRefs.includes(ref))) {
-    throw new Error("direct-skill candidate evidence must be present in its material");
+  const missingMaterialRefs = evidenceRefs.filter((ref) => !material.evidenceRefs.includes(ref));
+  if (missingMaterialRefs.length > 0) {
+    // Both lists have already been validated against the same source. Models
+    // occasionally cite a valid tool observation only on the candidate; keep
+    // the material/candidate invariant by promoting those references instead
+    // of discarding an otherwise grounded module.
+    material.evidenceRefs = unique([...material.evidenceRefs, ...missingMaterialRefs]);
   }
   const authority = enumValue(value.authority, AUTHORITIES, "candidateModule.authority");
   if (authority === "task_hard_constraint" && !material.authorityEvidence) {

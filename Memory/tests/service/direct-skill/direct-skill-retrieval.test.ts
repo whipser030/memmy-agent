@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { DirectSkillModule, DirectSkillPackage } from "../../../src/algorithm/direct-skill/types.js";
 import {
+  extractDirectSkillTaskQuery,
   packageFromMemory,
+  selectFallbackModules,
   selectRequiredPackage,
   validateSelectedModules
 } from "../../../src/service/direct-skill/direct-skill-retrieval-service.js";
@@ -41,6 +43,23 @@ function skillPackage(packageId: string): DirectSkillPackage {
 }
 
 describe("Direct Skill retrieval boundaries", () => {
+  it("extracts the actual GDPVal task from the runner wrapper", () => {
+    const prompt = [
+      "You are an execution agent. Complete exactly one GDPVal task.",
+      "",
+      "Task:",
+      "Research Napa Valley wineries and create a Word document.",
+      "",
+      "Inspect the supplied inputs when present.",
+      "Output requirements:",
+      "- Save the final file."
+    ].join("\n");
+
+    expect(extractDirectSkillTaskQuery(prompt))
+      .toBe("Research Napa Valley wineries and create a Word document.");
+    expect(extractDirectSkillTaskQuery("Fix the spreadsheet")).toBe("Fix the spreadsheet");
+  });
+
   it("keeps package memories out of every generic retrieval mode", () => {
     expect(directSkillExcludedTags("legacy")).toEqual(["direct-skill-package"]);
     expect(directSkillExcludedTags("off")).toEqual(["direct-trace", "direct-skill-package"]);
@@ -89,6 +108,7 @@ describe("Direct Skill retrieval boundaries", () => {
       .toEqual(["m1", "m3"]);
     expect(() => validateSelectedModules(["unknown"], ["m1"], modules)).toThrow(/outside/);
     expect(() => validateSelectedModules(["m1", "m2"], ["m1", "m2"], modules)).toThrow(/mutually exclusive/);
+    expect(selectFallbackModules(["m1", "m2", "m3"], modules)).toEqual(["m1", "m3"]);
   });
 
   it("always selects a package when candidates exist", () => {

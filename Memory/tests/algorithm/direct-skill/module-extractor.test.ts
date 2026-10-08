@@ -273,6 +273,57 @@ describe("ModuleExtractor", () => {
     expect(result.decision).toBe("accept");
     if (result.decision === "accept") expect(result.modules[0]!.material.authorityEvidence).toBeUndefined();
   });
+
+  it("normalizes valid candidate evidence omitted from material evidence", async () => {
+    const llm = fakeLlm(async () => ({
+      decision: "accept",
+      modules: [{
+        material: {
+          subgoal: "save",
+          outcome: "success",
+          observation: "The save tool completed",
+          proposedAction: "Save the deliverable",
+          scopeClues: [],
+          evidenceRefs: ["turn-1"],
+          authorityEvidence: null
+        },
+        candidateModule: {
+          semanticKey: "save_deliverable",
+          type: "tactic",
+          instruction: "Save the completed deliverable.",
+          scope: { tasks: [], tools: ["save"], resources: [], operations: ["save"] },
+          triggerEvents: ["before_submit"],
+          completionRule: "The save tool reports success.",
+          requiredEvidence: ["successful save result"],
+          recovery: "Retry the save.",
+          evidenceRefs: ["sourceId:tool:0"],
+          authority: "task_evidence",
+          evidencePattern: "single_observation"
+        }
+      }]
+    }));
+    const result = await new ModuleExtractor(llm).extractFromTurn({
+      sourceType: "turn",
+      sourceId: "turn-1",
+      episodeId: "episode-1",
+      outcome: "success",
+      userRequest: "save",
+      assistantFinalAnswer: "saved",
+      subgoal: "save",
+      summary: "saved",
+      toolSteps: [{
+        evidenceRef: "turn-1:tool:0",
+        call: { id: "call-1", name: "save", arguments: {} },
+        result: { status: "saved" }
+      }],
+      evaluation: { rTask: 1, detail: {} }
+    });
+    expect(result.decision).toBe("accept");
+    if (result.decision === "accept") {
+      expect(result.modules[0]!.material.evidenceRefs).toEqual(["turn-1", "turn-1:tool:0"]);
+      expect(result.modules[0]!.candidateModule.evidenceRefs).toEqual(["turn-1:tool:0"]);
+    }
+  });
 });
 
 function fakeLlm(

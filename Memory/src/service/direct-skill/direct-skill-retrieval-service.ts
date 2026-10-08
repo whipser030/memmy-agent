@@ -19,6 +19,27 @@ const RUNTIME_MANAGED_MARKER = "direct_skill_v1";
 const ROUTE_CANDIDATE_LIMIT = 8;
 const MODEL_TIMEOUT_MS = 30_000;
 
+const TASK_END_MARKERS = [
+  "Inspect the supplied inputs when present.",
+  "You must satisfy the following criteria:",
+  "Reference files:",
+  "Output requirements:"
+];
+
+export function extractDirectSkillTaskQuery(query: string): string {
+  const trimmed = query.trim();
+  if (!trimmed) return "";
+  const taskMarker = /(?:^|\n)Task:\s*(?:\n|$)/iu.exec(trimmed);
+  if (!taskMarker) return trimmed;
+  const taskStart = taskMarker.index + taskMarker[0].length;
+  let task = trimmed.slice(taskStart).trim();
+  const markerOffsets = TASK_END_MARKERS
+    .map((marker) => task.indexOf(marker))
+    .filter((offset) => offset >= 0);
+  if (markerOffsets.length > 0) task = task.slice(0, Math.min(...markerOffsets)).trim();
+  return task || trimmed;
+}
+
 interface DirectSkillRetrievalDependencies {
   repos: Repositories;
   readonly config: MemmyConfig;
@@ -40,9 +61,14 @@ export class DirectSkillRetrievalService {
 
   async routePackage(request: RouteDirectSkillPackageRequest): Promise<RouteDirectSkillPackageResponse> {
     const query = request.query.trim();
-    if (!query || this.deps.config.algorithm.skill.directMode !== "package_v1") {
-      return { package: null };
+    const directMode = this.deps.config.algorithm.skill.directMode;
+    if (!query) {
+      return { package: null, reason: "empty_query", candidateCount: 0, directMode };
     }
+    if (directMode !== "package_v1") {
+      return { package: null, reason: "disabled_mode", candidateCount: 0, directMode };
+    }
+    const retrievalQuery = extractDirectSkillTaskQuery(query);
     const context = this.deps.resolveContext(request);
     const retrieval = this.deps.config.algorithm.retrieval;
     const filter = {
@@ -53,7 +79,7 @@ export class DirectSkillRetrievalService {
       keywordTopK: retrieval.keywordTopK,
       tagFilter: retrieval.tagFilter
     };
-    const compiledQuery = compileRetrievalQuery(query, null, { domain: this.deps.config.domain });
+    const compiledQuery = compileRetrievalQuery(retrievalQuery, null, { domain: this.deps.config.domain });
     const hasVectors = this.candidatePool.hasRetrievalVectorCandidates({
       userId: context.userId,
       layers: ["Skill"],
@@ -63,7 +89,7 @@ export class DirectSkillRetrievalService {
     let queryVector: number[] | undefined;
     if (hasVectors) {
       try {
-        queryVector = await this.deps.embedder.embedOne(query, "query");
+        queryVector = await this.deps.embedder.embedOne(retrievalQuery, "query");
       } catch {
         // FTS and pattern routes remain available when query embedding is unavailable.
       }
@@ -84,10 +110,10 @@ export class DirectSkillRetrievalService {
       .filter((value): value is DirectSkillPackage => value !== null)
       .slice(0, ROUTE_CANDIDATE_LIMIT);
     if (candidates.length === 0) {
-      return { package: null };
+      return { package: null, reason: "no_candidates", candidateCount: 0, directMode };
     }
     if (!this.deps.skillLlm.isConfigured()) {
-      return { package: candidates[0]! };
+      return { package: candidates[0]!, reason: "selected_by_rank", candidateCount: candidates.length, directMode };
     }
 
     try {
@@ -105,7 +131,7 @@ export class DirectSkillRetrievalService {
         {
           role: "user",
           content: JSON.stringify({
-            task: query,
+            task: retrievalQuery,
             toolNames: request.toolNames,
             workspace: request.workspace,
             candidates: candidates.map((candidate) => ({
@@ -130,9 +156,22 @@ export class DirectSkillRetrievalService {
         maxTokens: 256,
         jsonMode: true
       });
-      return { package: selectRequiredPackage(candidates, response.packageId) };
+      const selected = selectRequiredPackage(candidates, response.packageId);
+      const modelSelected = typeof response.packageId === "string"
+        && candidates.some((candidate) => candidate.packageId === response.packageId);
+      return {
+        package: selected,
+        reason: modelSelected ? "selected_by_model" : "selected_by_rank",
+        candidateCount: candidates.length,
+        directMode
+      };
     } catch {
-      return { package: candidates[0]! };
+      return {
+        package: candidates[0]!,
+        reason: "model_fallback",
+        candidateCount: candidates.length,
+        directMode
+      };
     }
   }
 
@@ -155,52 +194,59 @@ export class DirectSkillRetrievalService {
       return { packageId: request.packageId, selectedModuleIds: [], reason: "invalid_candidates" };
     }
     if (!this.deps.skillLlm.isConfigured()) {
-      return { packageId: request.packageId, selectedModuleIds: [], reason: "model_unavailable" };
+      return {
+        packageId: request.packageId,
+        selectedModuleIds: selectFallbackModules(candidateIds, moduleById),
+        reason: "model_unavailable_fallback"
+      };
     }
 
-    const response = await this.deps.skillLlm.completeJson<{
-      selectedModuleIds?: unknown;
-      reason?: unknown;
-    }>([
-      {
-        role: "system",
-        content: [
-          "Choose the smallest useful set of Direct Skill Modules for this runtime event.",
-          "Return JSON only: {\"selectedModuleIds\": string[], \"reason\": string}.",
-          "Use only listed candidate IDs. Select at most one module from each alternativeGroupKey.",
-          "Do not invent a strength-priority policy; judge relevance from the task trajectory and event."
-        ].join("\n")
-      },
-      {
-        role: "user",
-        content: JSON.stringify({
-          event: request.event,
-          taskMessages: request.taskMessages,
-          draftFinalAnswer: request.draftFinalAnswer,
-          candidates: candidateIds.map((id) => moduleById.get(id))
-        })
-      }
-    ], {
-      operation: "direct_skill.select_modules.v1",
-      thinkingMode: "disabled",
-      temperature: 0,
-      timeoutMs: MODEL_TIMEOUT_MS,
-      maxRetries: 1,
-      maxTokens: 512,
-      jsonMode: true
-    });
-
-    const selected = Array.isArray(response.selectedModuleIds)
-      ? response.selectedModuleIds.filter((id): id is string => typeof id === "string")
-      : [];
     try {
+      const response = await this.deps.skillLlm.completeJson<{
+        selectedModuleIds?: unknown;
+        reason?: unknown;
+      }>([
+        {
+          role: "system",
+          content: [
+            "Choose the smallest useful set of Direct Skill Modules for this runtime event.",
+            "Return JSON only: {\"selectedModuleIds\": string[], \"reason\": string}.",
+            "Use only listed candidate IDs. Select at most one module from each alternativeGroupKey.",
+            "Do not invent a strength-priority policy; judge relevance from the task trajectory and event."
+          ].join("\n")
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            event: request.event,
+            taskMessages: request.taskMessages,
+            draftFinalAnswer: request.draftFinalAnswer,
+            candidates: candidateIds.map((id) => moduleById.get(id))
+          })
+        }
+      ], {
+        operation: "direct_skill.select_modules.v1",
+        thinkingMode: "disabled",
+        temperature: 0,
+        timeoutMs: MODEL_TIMEOUT_MS,
+        maxRetries: 1,
+        maxTokens: 512,
+        jsonMode: true
+      });
+      const selected = Array.isArray(response.selectedModuleIds)
+        ? response.selectedModuleIds.filter((id): id is string => typeof id === "string")
+        : [];
       return {
         packageId: request.packageId,
         selectedModuleIds: validateSelectedModules(selected, candidateIds, moduleById),
         reason: typeof response.reason === "string" ? response.reason : "selected_by_model"
       };
     } catch {
-      return { packageId: request.packageId, selectedModuleIds: [], reason: "invalid_model_selection" };
+      return {
+        packageId: request.packageId,
+        selectedModuleIds: selectFallbackModules(candidateIds, moduleById),
+        reason: "model_fallback"
+      };
     }
   }
 }
@@ -232,6 +278,23 @@ export function validateSelectedModules(
       throw new Error(`model selected mutually exclusive Modules from ${group}`);
     }
     usedAlternativeGroups.add(group);
+  }
+  return selected;
+}
+
+export function selectFallbackModules(
+  candidateModuleIds: readonly string[],
+  moduleById: ReadonlyMap<string, DirectSkillModule>
+): string[] {
+  const selected: string[] = [];
+  const usedAlternativeGroups = new Set<string>();
+  for (const id of uniqueNonEmpty(candidateModuleIds)) {
+    const module = moduleById.get(id);
+    if (!module) continue;
+    const group = module.alternativeGroupKey?.trim();
+    if (group && usedAlternativeGroups.has(group)) continue;
+    selected.push(id);
+    if (group) usedAlternativeGroups.add(group);
   }
   return selected;
 }

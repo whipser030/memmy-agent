@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import plugin from "./index.js";
 
-function makeHarness({ directSkillOnly = true } = {}) {
+function makeHarness({ directSkillOnly = true, directSkillMode = "package_v1" } = {}) {
   const hooks = new Map();
   const middleware = [];
   const completed = [];
   const requests = [];
   const tools = [];
   const memoryCapabilities = [];
+  const services = [];
   globalThis.fetch = async (url, init = {}) => {
     const path = new URL(url).pathname;
     const body = init.body ? JSON.parse(init.body) : {};
@@ -30,6 +31,7 @@ function makeHarness({ directSkillOnly = true } = {}) {
     };
     else if (path.endsWith("/direct-skills/select-modules")) payload = { selectedModuleIds: [body.candidateModuleIds[0]] };
     else if (path.includes("/complete")) { completed.push(body); payload = { ok: true }; }
+    else if (path.endsWith("/health")) payload = { ok: true, capabilities: { directSkillMode } };
     else payload = { ok: true };
     return { ok: true, json: async () => payload, text: async () => JSON.stringify(payload) };
   };
@@ -37,13 +39,13 @@ function makeHarness({ directSkillOnly = true } = {}) {
     pluginConfig: { directSkillOnly },
     registerTool(tool) { tools.push(tool); },
     registerMemoryCapability(capability) { memoryCapabilities.push(capability); },
-    registerService() {},
+    registerService(service) { services.push(service); },
     registerAgentToolResultMiddleware(handler, options) { middleware.push({ handler, options }); },
     on(name, handler) { hooks.set(name, handler); },
     logger: { warn(message) { throw new Error(message); } },
   };
   plugin.register(api);
-  return { hooks, middleware, completed, requests, tools, memoryCapabilities };
+  return { hooks, middleware, completed, requests, tools, memoryCapabilities, services };
 }
 
 test("registers the official OpenClaw hooks and middleware contract", () => {
@@ -62,6 +64,19 @@ test("keeps generic memory tools available outside direct-skill-only mode", () =
   const { tools, memoryCapabilities } = makeHarness({ directSkillOnly: false });
   assert.equal(tools.length, 6);
   assert.equal(memoryCapabilities.length, 1);
+});
+
+test("fails startup when direct-skill-only mode is backed by a legacy server", async () => {
+  const { services } = makeHarness({ directSkillMode: "legacy" });
+  await assert.rejects(
+    services[0].start(),
+    /requires algorithm\.skill\.directMode=package_v1/
+  );
+});
+
+test("accepts startup when package-v1 routing is active", async () => {
+  const { services } = makeHarness();
+  await services[0].start();
 });
 
 test("injects turn-start, tool-error, and before-submit modules at the right seams", async () => {
@@ -126,4 +141,58 @@ test("captures typed after-tool-call events when result middleware is not invoke
     arguments: { command: "python build.py" },
   });
   assert.equal(completed[0].toolResults.length, 1);
+});
+
+test("captures failed turns even when the runtime emits no final answer", async () => {
+  const { hooks, completed } = makeHarness();
+  const ctx = { runId: "run-failed", sessionKey: "task-failed", sessionId: "native-failed", agentId: "main" };
+  await hooks.get("before_prompt_build")({ prompt: "Create the report", messages: [] }, ctx);
+  await hooks.get("agent_end")({
+    runId: ctx.runId,
+    success: false,
+    error: { message: "Context overflow" },
+    messages: [{ role: "user", content: "Create the report" }],
+  }, ctx);
+
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].status, "failed");
+  assert.match(completed[0].answer, /without a final assistant answer/);
+  assert.match(completed[0].answer, /Context overflow/);
+});
+
+test("treats OpenClaw isError terminal events as failed", async () => {
+  const { hooks, completed } = makeHarness();
+  const ctx = { runId: "run-is-error", sessionKey: "task-is-error", agentId: "main" };
+  await hooks.get("before_prompt_build")({ prompt: "Create the report", messages: [] }, ctx);
+  await hooks.get("agent_end")({
+    runId: ctx.runId,
+    isError: true,
+    messages: [{ role: "assistant", content: "Partial result" }],
+  }, ctx);
+
+  assert.equal(completed[0].status, "failed");
+});
+
+test("flushes an unfinished turn when the session ends", async () => {
+  const { hooks, completed } = makeHarness();
+  const ctx = { runId: "run-ended", sessionKey: "task-ended", agentId: "main" };
+  await hooks.get("before_prompt_build")({ prompt: "Create the report", messages: [] }, ctx);
+  await hooks.get("session_end")({}, ctx);
+
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].status, "failed");
+  assert.match(completed[0].answer, /before OpenClaw emitted a terminal agent result/);
+});
+
+test("uses a distinct memory session id for a resume run", async () => {
+  process.env.MEMMY_SESSION_ID_SUFFIX = "resume-1";
+  try {
+    const { hooks, requests } = makeHarness();
+    const ctx = { runId: "run-resume", sessionKey: "task-resume", sessionId: "native-resume", agentId: "main" };
+    await hooks.get("before_prompt_build")({ prompt: "Resume the report", messages: [] }, ctx);
+    const opened = requests.find((request) => request.path.endsWith("/sessions/open"));
+    assert.equal(opened.body.sessionId, "openclaw:task-resume:resume-1");
+  } finally {
+    delete process.env.MEMMY_SESSION_ID_SUFFIX;
+  }
 });

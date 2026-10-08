@@ -756,7 +756,8 @@ export class MemoryService {
         ],
         memoryLayers: ["L1", "L2", "L3", "Skill"],
         supportsCli: true,
-        service: [...MEMORY_CAPABILITIES]
+        service: [...MEMORY_CAPABILITIES],
+        directSkillMode: this.config.algorithm.skill.directMode
       },
       ...(backend.backendId === "sqlite-local" && schema.version >= 6
         ? {

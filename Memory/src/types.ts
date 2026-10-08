@@ -522,6 +522,9 @@ export interface RouteDirectSkillPackageRequest extends RequestEnvelope {
 
 export interface RouteDirectSkillPackageResponse {
   package: DirectSkillPackage | null;
+  reason: "empty_query" | "disabled_mode" | "no_candidates" | "selected_by_rank" | "selected_by_model" | "model_fallback";
+  candidateCount: number;
+  directMode: "off" | "legacy" | "package_v1";
 }
 
 export interface SelectDirectSkillModulesRequest extends RequestEnvelope {
@@ -666,6 +669,7 @@ export interface HealthResponse {
     memoryLayers: MemoryLayer[];
     supportsCli: boolean;
     service: string[];
+    directSkillMode: "off" | "legacy" | "package_v1";
   };
   features?: L3WorldModelFeatures;
   serverTime: IsoTime;
